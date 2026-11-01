@@ -83,6 +83,11 @@ button{cursor:pointer}button:focus-visible,input:focus{outline:2px solid #3cc3d2
 .px-cam p{margin:0;padding:8px 12px;font-size:13px;color:#9fd9df}
 .px-pied{font-size:12px;color:#5b7279;display:flex;justify-content:center;gap:12px;flex-wrap:wrap}
 .px-pied button{font:inherit;font-size:12px;border:0;background:none;color:#0a7f8f;text-decoration:underline;padding:0}
+.px-mdp{display:flex;flex-direction:column;gap:10px;background:#fff;border:1px solid #d6e1e4;border-radius:14px;padding:16px}
+.px-mdp label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#5b7279}
+.px-mdp input{font:inherit;font-size:16px;padding:10px;border:1px solid #c4d3d7;border-radius:10px}
+.px-mdp button{font:inherit;font-weight:600;min-height:44px;border:0;border-radius:10px;background:#0e2f3a;color:#fff}
+.px-mdp-msg{font-size:13px;color:#1f6b4a;min-height:18px}.px-mdp-msg.erreur{color:#8a3415}
 `;
   const LOGO = '<svg width="34" height="34" viewBox="0 0 58 58" aria-hidden="true"><circle cx="29" cy="29" r="27" fill="#0e2f3a"/><path d="M11 32c4-4 8-4 12 0s8 4 12 0 8-4 12 0" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/><path d="M11 41c4-4 8-4 12 0s8 4 12 0 8-4 12 0" fill="none" stroke="#3cc3d2" stroke-width="3.5" stroke-linecap="round"/><circle cx="29" cy="19" r="5" fill="#3cc3d2"/></svg>';
 
@@ -280,8 +285,48 @@ button{cursor:pointer}button:focus-visible,input:focus{outline:2px solid #3cc3d2
     const heure = el('span'); heure.id = 'px-heure';
     const sortir = el('button', '', 'Se déconnecter'); sortir.type = 'button';
     sortir.onclick = async () => { try { await api('/logout', ''); } catch (x) { /* déjà déconnecté */ } afficherConnexion(); };
-    pied.append(qui, heure, sortir);
-    racine.append(pied);
+    const changer = el('button', '', 'Mot de passe'); changer.type = 'button';
+    pied.append(qui, heure, changer, sortir);
+    const panneau = formulaireMotDePasse();
+    panneau.hidden = true;
+    changer.onclick = () => { panneau.hidden = !panneau.hidden; if (!panneau.hidden) panneau.querySelector('input').focus(); };
+    racine.append(pied, panneau);
+  }
+
+  // Changement du mot de passe du compte connecté (gardé dans le boîtier)
+  function formulaireMotDePasse() {
+    const f = el('form', 'px-mdp');
+    f.append(el('b', '', 'Changer mon mot de passe'));
+    const champs = [['px-mdp-a', 'Mot de passe actuel', 'current-password'],
+                    ['px-mdp-n', 'Nouveau (6 à 22 caractères)', 'new-password'],
+                    ['px-mdp-c', 'Nouveau, encore une fois', 'new-password']].map(([id, txt, ac]) => {
+      const l = el('label', '', txt), i = el('input');
+      i.id = id; i.type = 'password'; i.autocomplete = ac; i.required = true;
+      l.append(i); f.append(l); return i;
+    });
+    const msg = el('div', 'px-mdp-msg'); msg.setAttribute('role', 'status');
+    const b = el('button', '', 'Enregistrer'); b.type = 'submit';
+    f.append(msg, b);
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const [a, n, c] = champs.map((i) => i.value);
+      msg.className = 'px-mdp-msg erreur';
+      if (n.length < 6 || n.length > 22) { msg.textContent = 'Le nouveau mot de passe doit faire entre 6 et 22 caractères.'; return; }
+      if (n !== c) { msg.textContent = 'Les deux nouveaux mots de passe ne sont pas identiques.'; return; }
+      b.disabled = true;
+      try {
+        const r = await api('/api/motdepasse', 'a=' + encodeURIComponent(a) + '&n=' + encodeURIComponent(n));
+        if (r.ok) {
+          msg.className = 'px-mdp-msg'; msg.textContent = 'Mot de passe enregistré.';
+          champs.forEach((i) => { i.value = ''; });
+        } else msg.textContent = 'Le mot de passe actuel est incorrect.';
+      } catch (x) {
+        if (x instanceof NonConnecte) { afficherConnexion(); return; }
+        msg.textContent = 'Le boîtier ne répond pas, réessaie.';
+      }
+      b.disabled = false;
+    });
+    return f;
   }
 
   // Valeurs communes, quel que soit le boîtier
