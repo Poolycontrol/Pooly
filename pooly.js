@@ -39,7 +39,8 @@
     pooly:   { nom: 'Pooly',    aide: 'Filtration selon la température : {heures} h par jour, de {plage}.' },
     auto:    { nom: 'Auto',     aide: 'Filtration selon tes horaires : {auto}. Réglage dans l’onglet Programmes.' },
     manuel:  { nom: 'Manuel',   aide: 'Tu commandes la pompe toi-même.' },
-    horsgel: { nom: 'Hors-gel', aide: 'Pompe en continu si l’eau descend sous {seuil} °C, sinon programme Pooly ({plage}).' }
+    horsgel: { nom: 'Hors-gel', aide: 'Pompe en continu si l’eau descend sous {seuil} °C, sinon programme Pooly ({plage}).' },
+    off:     { nom: 'Off',      aide: 'Arrêt forcé : la pompe ne démarre jamais, même par gel.' }
   };
 
   // Fiche « Ma piscine » : 8 valeurs, 0 = non renseigné
@@ -176,6 +177,7 @@ button:disabled{opacity:.6}
   let racine = document.getElementById('app');
   if (!racine) { racine = document.createElement('div'); document.body.appendChild(racine); }
   racine.removeAttribute('style');
+  document.body.removeAttribute('style');   // le fond sombre de chargement ne doit pas masquer l'interface
 
   // ------------------------------------------------------------------
   //  Outils
@@ -841,7 +843,7 @@ button:disabled{opacity:.6}
 
     document.querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.mode === e.mode));
     const m = cfg.modes.find((x) => x.id === e.mode);
-    $('px-aide').textContent = m ? m.aide.replace('{heures}', e.heures).replace(/\{plage\}/g, plageTexte(e))
+    $('px-aide').textContent = e._jamais ? '' : m ? m.aide.replace('{heures}', e.heures).replace(/\{plage\}/g, plageTexte(e))
       .replace('{seuil}', e.seuil).replace('{auto}', autoTexte(e)) : '';
 
     cfg.sorties.forEach((s) => {
