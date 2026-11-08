@@ -618,7 +618,7 @@ button:disabled{opacity:.6}
   function ouvrir(id) {
     if (!vues[id]) id = 'accueil';
     ongletActif = id;
-    Object.entries(vues).forEach(([k, v]) => { if (v) v.hidden = k !== id; });
+    Object.entries(vues).forEach(([k, v]) => { if (v)     Object.entries(vues).forEach(([k, v]) => { if (v) { v.hidden = k !== id; v.style.display = k === id ? '' : 'none'; } });; });
     document.querySelectorAll('[data-onglet]').forEach((b) => {
       if (b.dataset.onglet === id) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
     });
