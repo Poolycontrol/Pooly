@@ -1,0 +1,1639 @@
+/*
+  POOLY — interface commune à tous les boîtiers (Uno, Mega, R4 WiFi)
+  Version de l'interface : 1.4.2
+  ------------------------------------------------------------------
+  1.4.2 (10 novembre 2026) :
+    - Nouvel onglet « Pooly » : l'assistant (petit robot) qui répond aux
+      questions sur la piscine. Recherche par mots-clés, tolérante aux fautes,
+      réponses adaptées à la fiche « Ma piscine » et à l'état du boîtier.
+    - Bouton « Poser une question à Pooly » dans l'accueil.
+    - Onglets : ouvrir() force aussi style.display (correctif du 8 novembre).
+  ------------------------------------------------------------------
+  Deux chemins, un seul fichier :
+
+  1. EN LIGNE (site GitHub Pages, index.html définit window.POOLY_SUPABASE)
+     Connexion par e-mail via Supabase, accessible hors de la maison.
+     - L'état est lu dans la table `etats` (colonne donnees).
+     - Les commandes sont écrites dans la table `ordres`.
+     - La fiche piscine est enregistrée dans `fiches_piscine`.
+
+  2. EN LOCAL (page de lancement servie par le boîtier, pas de POOLY_SUPABASE)
+     Fonctionnement d'origine : /login, /api/config, /api/etat…
+     C'est le mode secours si internet est coupé.
+
+  CONTRAT AVEC LA R4 (mode en ligne)
+  - La R4 appelle boitier_synchroniser(p_serie, p_cle, p_etat) avec :
+      p_etat = { "config": <même JSON que /api/config>,
+                 "etat":   <même JSON que /api/etat> }
+  - Ordres à exécuter (table ordres, colonnes type / cible / valeur) :
+      mode       cible = null      valeur = { "mode": "pooly|auto|manuel|horsgel" }
+      sortie     cible = id sortie valeur = { "on": true|false }
+      programme  cible = id sortie valeur = { "v": [ ... ] }  (même format que /api/programme)
+      entretien  cible = "0|1|2"   valeur = { "t": timestamp|null }
+      profil     cible = null      valeur = { "v": [8 valeurs] }
+
+  Onglets : Accueil · Programmes · Pooly · Piscine · Compte
+*/
+(function () {
+  'use strict';
+
+  const WEB_VERSION = '1.4.2';
+
+  // ------------------------------------------------------------------
+  //  Réglages communs à toute la gamme
+  // ------------------------------------------------------------------
+  const MODES = {
+    pooly:   { nom: 'Thermo',   aide: 'Filtration selon la température de l’eau : {heures} h par jour, de {plage}.' },
+    auto:    { nom: 'Auto',     aide: 'Filtration selon tes horaires : {auto}. Réglage dans l’onglet Programmes.' },
+    manuel:  { nom: 'Manuel',   aide: 'Tu commandes la pompe toi-même.' },
+    horsgel: { nom: 'Hors-gel', aide: 'Pompe en continu si l’eau descend sous {seuil} °C, sinon programme Thermo ({plage}).' },
+    off:     { nom: 'Off',      aide: 'Arrêt forcé : la pompe ne démarre jamais, même par gel.' }
+  };
+
+  // Fiche « Ma piscine » : 8 valeurs, 0 = non renseigné
+  const P_VOLUME = 0, P_DESINF = 1, P_PH = 2, P_FILTRE = 3, P_REVET = 4, P_CHAUF = 5, P_COUV = 6;
+  const CHOIX = {
+    [P_DESINF]: { nom: 'Désinfectant', options: ['Chlore (galets ou granulés)', 'Chlore liquide', 'Électrolyseur au sel', 'Brome', 'Oxygène actif', 'PHMB (sans chlore)'] },
+    [P_PH]:     { nom: 'Régulation du pH', options: ['Non, je corrige à la main', 'Oui, régulateur automatique'] },
+    [P_FILTRE]: { nom: 'Filtre', options: ['Sable', 'Verre', 'Cartouche', 'Diatomée'] },
+    [P_REVET]:  { nom: 'Revêtement', options: ['Liner', 'PVC armé', 'Carrelage / béton', 'Coque polyester'] },
+    [P_CHAUF]:  { nom: 'Chauffage', options: ['Aucun', 'Pompe à chaleur', 'Réchauffeur électrique', 'Solaire'] },
+    [P_COUV]:   { nom: 'Couverture', options: ['Aucune', 'Bâche', 'Volet roulant', 'Abri'] }
+  };
+  const SMODES_NOMS = { off: 'Off', auto: 'Auto', on: 'On' };
+  const FILTRE = { SABLE: 1, VERRE: 2, CARTOUCHE: 3, DIATOMEE: 4 };
+  const DESINF = { CHLORE: 1, CHLORE_LIQUIDE: 2, ELECTROLYSEUR: 3, BROME: 4 };
+
+  // Entretiens : les deux premiers se comptent en heures de filtration, le troisième en années
+  function entretiens(profil) {
+    const f = profil ? profil[P_FILTRE] : 0;
+    return [
+      { nom: f === FILTRE.CARTOUCHE ? 'Nettoyage de la cartouche' : 'Contre-lavage du filtre', heures: 60 },
+      { nom: 'Nettoyage du préfiltre', heures: 30 },
+      f === FILTRE.DIATOMEE ? null
+        : f === FILTRE.CARTOUCHE ? { nom: 'Changement de la cartouche', ans: 2 }
+        : f === FILTRE.VERRE ? { nom: 'Changement du verre filtrant', ans: 10 }
+        : { nom: 'Changement du sable', ans: 5 }
+    ];
+  }
+
+  // Configuration utilisée en ligne tant que le boîtier n'a pas envoyé la sienne
+  function configParDefaut() {
+    return {
+      modele: 'Pooly Simply',
+      capteurs: [{ id: 'eau', nom: 'Température de l’eau', unite: '°C', decimales: 1, principal: true }],
+      sorties: [
+        { id: 'pompe', nom: 'Pompe de filtration', on: 'En marche', off: 'Arrêtée', pompe: true, type: 'pompe' },
+        { id: 'eclairage', nom: 'Éclairage piscine', on: 'Allumé', off: 'Éteint', type: 'lumiere' }
+      ],
+      modes: ['pooly', 'auto', 'manuel', 'horsgel', 'off'], smodes: ['off', 'on', 'auto'],
+      programmes: true, profil: true, entretien: true
+    };
+  }
+
+  // ------------------------------------------------------------------
+  //  Apparence
+  // ------------------------------------------------------------------
+  const CSS = `
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:#eef4f5;color:#0f2a33;font-family:Archivo,system-ui,sans-serif}
+.px-cx{min-height:100vh;display:grid;place-items:center;background:#0e2f3a;color:#fff;padding:16px}
+.px-cx form{width:100%;max-width:340px;display:flex;flex-direction:column;gap:14px}
+.px-cx h1{margin:0;font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-weight:800;font-size:44px;letter-spacing:.06em}
+.px-cx .sous{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#9fd9df;margin:-10px 0 10px}
+.px-cx p{margin:0;font-size:14px;line-height:1.45;color:#cfe9ec}
+.px-cx label{font-size:13px;color:#9fd9df;display:flex;flex-direction:column;gap:6px}
+.px-cx input{font:inherit;font-size:16px;padding:12px;border-radius:10px;border:1px solid #2c5866;background:#12394a;color:#fff}
+.px-cx button{font:inherit;font-weight:600;font-size:16px;min-height:48px;border:0;border-radius:10px;background:#3cc3d2;color:#0e2f3a}
+.px-cx button.px-second{background:none;border:1px solid #2c5866;color:#9fd9df}
+.px-err{background:#5a2316;color:#ffd7c9;padding:10px 12px;border-radius:10px;font-size:14px}
+.px-app{max-width:440px;margin:0 auto;padding:20px 18px calc(96px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:14px}
+.px-vue{display:flex;flex-direction:column;gap:14px}
+.px-haut{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.px-marque{display:flex;align-items:center;gap:10px}
+.px-marque b{display:block;font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-weight:800;font-size:30px;letter-spacing:.06em;line-height:1}
+.px-marque small,.px-titre{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#5b7279}
+.px-etat{display:flex;align-items:center;gap:6px;font-size:13px;padding:6px 10px;border-radius:999px;background:#dff3ea;color:#2b6b52;white-space:nowrap}
+.px-etat i{width:8px;height:8px;border-radius:50%;background:#1f8a5b}
+.px-etat.off{background:#fbe9e2;color:#8a3415}.px-etat.off i{background:#c2471d}
+.px-carte{background:#0e2f3a;color:#fff;border-radius:18px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.px-lib{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#9fd9df}
+.px-grand{display:flex;align-items:baseline;gap:6px;font-family:'Barlow Condensed',sans-serif}
+.px-grand b{font-weight:700;font-size:84px;line-height:.85}.px-grand span{font-size:30px;color:#9fd9df}
+.px-tuiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.px-tuiles div{display:flex;flex-direction:column;gap:2px;padding:10px 12px;background:rgba(255,255,255,.08);border-radius:10px;min-width:0}
+.px-tuiles small{font-size:12px;color:#9fd9df}
+.px-tuiles strong{font-family:'JetBrains Mono',monospace;font-weight:500;font-size:15px;overflow-wrap:anywhere}
+.px-conseils{display:flex;flex-direction:column;gap:8px}
+.px-conseil{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:14px;font-size:14px;line-height:1.4;background:#fff;border:1px solid #d6e1e4}
+.px-conseil i{flex:none;width:10px;height:10px;border-radius:50%;margin-top:5px;background:#1f8a5b}
+.px-conseil.info i{background:#0a7f8f}
+.px-conseil.attention{background:#fdf3dc;border-color:#f0d79a}.px-conseil.attention i{background:#c58a00}
+.px-conseil.alerte{background:#fbe9e2;border-color:#f0b9a5}.px-conseil.alerte i{background:#c2471d}
+.px-modes{display:grid;gap:6px;background:#dbe6e8;padding:4px;border-radius:12px}
+.px-modes button{font:inherit;min-height:44px;border:0;border-radius:9px;font-weight:600;font-size:14px;background:none;color:#3f5a61;padding:0 4px}
+.px-modes button[aria-pressed=true]{background:#0e2f3a;color:#fff}
+.px-entete{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.px-entete>div{display:flex;flex-direction:column;gap:2px;min-width:0}
+.px-entete b{font-weight:600}.px-entete small{font-size:13px;color:#5b7279}
+.px-aide{font-size:13px;color:#5b7279;min-height:18px}
+.px-liste{display:flex;flex-direction:column;gap:8px}
+.px-ligne{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#fff;border:1px solid #d6e1e4;border-radius:14px;padding:12px 14px}
+.px-ligne>div{display:flex;flex-direction:column;gap:2px;min-width:0}
+.px-ligne b{font-weight:600}.px-ligne small{font-size:13px;color:#5b7279}
+.px-ligne small.du{color:#8a3415;font-weight:600}
+.px-inter{flex:none;position:relative;width:56px;height:32px;border:0;border-radius:999px;padding:0;background:#c4d3d7}
+.px-inter::after{content:"";position:absolute;top:4px;left:4px;width:24px;height:24px;border-radius:50%;background:#fff;transition:left .15s}
+.px-inter[aria-pressed=true]{background:#0a7f8f}.px-inter[aria-pressed=true]::after{left:28px}
+.px-fait{flex:none;font:inherit;font-weight:600;font-size:14px;min-height:40px;padding:0 14px;border:1px solid #0a7f8f;border-radius:10px;background:#fff;color:#0a7f8f}
+.px-bloc{display:flex;flex-direction:column;gap:12px;background:#fff;border:1px solid #d6e1e4;border-radius:14px;padding:16px}
+.px-bloc h3{margin:0;font-size:16px;font-weight:600}
+.px-bloc p{margin:0;font-size:13px;color:#5b7279;line-height:1.4}
+.px-bloc label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#5b7279}
+.px-bloc input,.px-bloc select{font:inherit;font-size:16px;padding:10px;border:1px solid #c4d3d7;border-radius:10px;background:#fff;color:#0f2a33;width:100%}
+.px-bloc .px-cocher{flex-direction:row;align-items:center;gap:10px;font-size:15px;color:#0f2a33}
+.px-bloc .px-cocher input{width:22px;height:22px;accent-color:#0a7f8f}
+.px-deux{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.px-ok{font:inherit;font-weight:600;min-height:44px;border:0;border-radius:10px;background:#0e2f3a;color:#fff}
+.px-msg{font-size:13px;color:#1f6b4a;min-height:18px}.px-msg.erreur{color:#8a3415}
+.px-sortir{font:inherit;font-weight:600;min-height:44px;border:1px solid #c2471d;border-radius:10px;background:#fff;color:#8a3415}
+button{cursor:pointer}button:focus-visible,input:focus,select:focus{outline:2px solid #3cc3d2;outline-offset:2px}
+button:disabled{opacity:.6}
+.px-cam{background:#0e2f3a;border-radius:14px;overflow:hidden}
+.px-cam img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover}
+.px-cam p{margin:0;padding:8px 12px;font-size:13px;color:#9fd9df}
+.px-nav{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:center;background:#fff;border-top:1px solid #d6e1e4;padding:6px max(8px,env(safe-area-inset-left,0px)) calc(6px + env(safe-area-inset-bottom,0px)) max(8px,env(safe-area-inset-right,0px));z-index:5}
+.px-nav div{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;width:100%;max-width:440px}
+.px-nav button{font:inherit;font-size:12px;font-weight:600;min-height:52px;border:0;border-radius:10px;background:none;color:#5b7279;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:0 2px}
+.px-nav button svg{width:22px;height:22px}
+.px-nav button[aria-current=page]{color:#0a7f8f;background:#e3f2f4}
+.px-demander{font:inherit;font-weight:600;font-size:15px;min-height:46px;border:1px solid #0a7f8f;border-radius:12px;background:#fff;color:#0a7f8f;display:flex;align-items:center;justify-content:center;gap:8px}
+.px-robot{display:flex;align-items:center;gap:12px}
+.px-robot svg{flex:none}
+.px-robot b{display:block;font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-weight:800;font-size:28px;letter-spacing:.04em;line-height:1}
+.px-robot small{font-size:13px;color:#5b7279}
+.px-cherche{display:flex;gap:8px}
+.px-cherche input{flex:1;min-width:0;font:inherit;font-size:16px;padding:12px;border:1px solid #c4d3d7;border-radius:12px;background:#fff;color:#0f2a33}
+.px-cherche button{flex:none;font:inherit;font-weight:600;font-size:15px;min-height:48px;padding:0 16px;border:0;border-radius:12px;background:#0e2f3a;color:#fff}
+.px-fil{display:flex;flex-direction:column;gap:10px}
+.px-fil:empty{display:none}
+.px-bulle{max-width:94%;padding:12px 14px;border-radius:16px;font-size:15px;line-height:1.45}
+.px-bulle.moi{align-self:flex-end;background:#0a7f8f;color:#fff;border-bottom-right-radius:4px}
+.px-bulle.pooly{align-self:flex-start;background:#fff;border:1px solid #d6e1e4;border-bottom-left-radius:4px}
+.px-bulle h4{margin:0 0 8px;font-size:15px;font-weight:600}
+.px-bulle p{margin:0 0 8px}.px-bulle p:last-child{margin-bottom:0}
+.px-bulle ul,.px-bulle ol{margin:0 0 8px;padding-left:20px}
+.px-bulle li{margin-bottom:3px}
+.px-perso{background:#e3f2f4;border-radius:10px;padding:10px 12px;margin-top:8px;font-size:14px;line-height:1.4}
+.px-perso b{display:block;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#0a7f8f;margin-bottom:2px}
+.px-aussi{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+.px-aussi small{font-size:12px;color:#5b7279}
+.px-puces{display:flex;flex-wrap:wrap;gap:6px}
+.px-puce{font:inherit;font-size:13px;font-weight:600;min-height:38px;padding:0 14px;border:1px solid #c4d3d7;border-radius:999px;background:#fff;color:#0f2a33}
+.px-puce[aria-pressed=true]{background:#0e2f3a;color:#fff;border-color:#0e2f3a}
+.px-questions{display:flex;flex-direction:column;gap:6px}
+.px-question{font:inherit;text-align:left;font-size:14px;line-height:1.35;min-height:44px;padding:10px 14px;border:1px solid #d6e1e4;border-radius:12px;background:#fff;color:#0f2a33}
+.px-pied{font-size:12px;color:#5b7279;line-height:1.4}
+`;
+  const LOGO = '<svg width="34" height="34" viewBox="0 0 58 58" aria-hidden="true"><circle cx="29" cy="29" r="27" fill="#0e2f3a"/><path d="M11 32c4-4 8-4 12 0s8 4 12 0 8-4 12 0" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/><path d="M11 41c4-4 8-4 12 0s8 4 12 0 8-4 12 0" fill="none" stroke="#3cc3d2" stroke-width="3.5" stroke-linecap="round"/><circle cx="29" cy="19" r="5" fill="#3cc3d2"/></svg>';
+  // Le petit robot Pooly
+  const ROBOT = (t) => '<svg width="' + t + '" height="' + t + '" viewBox="0 0 58 58" aria-hidden="true"><circle cx="29" cy="29" r="27" fill="#0e2f3a"/><path d="M29 10v5" stroke="#3cc3d2" stroke-width="3" stroke-linecap="round"/><circle cx="29" cy="8.5" r="3" fill="#3cc3d2"/><rect x="14" y="15" width="30" height="23" rx="8" fill="#fff"/><circle cx="23" cy="25.5" r="3.2" fill="#0e2f3a"/><circle cx="35" cy="25.5" r="3.2" fill="#0e2f3a"/><path d="M23.5 31.5c3 2.4 8 2.4 11 0" fill="none" stroke="#0a7f8f" stroke-width="2.5" stroke-linecap="round"/><path d="M11 46c4-3.5 8-3.5 12 0s8 3.5 12 0 8-3.5 12 0" fill="none" stroke="#3cc3d2" stroke-width="3" stroke-linecap="round"/></svg>';
+  const ICONES = {
+    accueil: '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/>',
+    programmes: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    pooly: '<rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4"/><path d="M9.5 13.2h.01M14.5 13.2h.01" stroke-width="2.6"/><path d="M10 16.2h4"/>',
+    piscine: '<path d="M3 15c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M3 19c2-2 4-2 6 0s4 2 6 0 4-2 6 0"/><path d="M8 13V5a2 2 0 0 1 4 0M16 13V5a2 2 0 0 0-4 0"/>',
+    compte: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>'
+  };
+  const icone = (n) => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONES[n] + '</svg>';
+
+  const lien = document.createElement('link');
+  lien.rel = 'stylesheet';
+  lien.href = 'https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800&family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap';
+  document.head.appendChild(lien);
+  const style = document.createElement('style');
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  let racine = document.getElementById('app');
+  if (!racine) { racine = document.createElement('div'); document.body.appendChild(racine); }
+  racine.removeAttribute('style');
+  document.body.removeAttribute('style');   // le fond sombre de chargement ne doit pas masquer l'interface
+
+  // ------------------------------------------------------------------
+  //  Outils
+  // ------------------------------------------------------------------
+  function el(tag, cls, txt) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt !== undefined) e.textContent = txt;
+    return e;
+  }
+  const $ = (id) => document.getElementById(id);
+  const nb = (v, d) => (v === null || v === undefined || isNaN(v)) ? '--' : Number(v).toFixed(d).replace('.', ',');
+  function hhmm(m) {
+    m = ((m % 1440) + 1440) % 1440;
+    return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+  }
+  function versMinutes(txt) {
+    const p = /^(\d{1,2}):(\d{2})$/.exec(txt || '');
+    return p ? Math.min(1439, Number(p[1]) * 60 + Number(p[2])) : null;
+  }
+  const dureePlage = (d, f) => d === f ? 0 : ((f - d + 1440) % 1440);
+  function champ(texte, type, id) {
+    const l = el('label', '', texte), i = el('input');
+    i.type = type; i.id = id; l.append(i);
+    return [l, i];
+  }
+  function message(zone, texte, erreur) { zone.className = 'px-msg' + (erreur ? ' erreur' : ''); zone.textContent = texte; }
+  function memoire(cle, val) {
+    try {
+      if (val === undefined) return localStorage.getItem(cle);
+      localStorage.setItem(cle, val);
+    } catch (x) { /* stockage indisponible : on fait sans */ }
+    return null;
+  }
+  function dureeTexte(min) {
+    if (min < 60) return min + ' min';
+    const h = Math.round(min / 60);
+    return h < 48 ? h + ' h' : Math.round(h / 24) + ' jours';
+  }
+
+  class NonConnecte extends Error {}
+  class AucunBoitier extends Error {}
+  class Refus extends Error {}
+
+  // ------------------------------------------------------------------
+  //  Aiguillage : en ligne (Supabase) ou en local (boîtier)
+  // ------------------------------------------------------------------
+  const SB_CFG = window.POOLY_SUPABASE || null;
+  const EN_LIGNE = !!SB_CFG;
+  let sb = null, utilisateur = null, boitier = null, fiche = null, attente = [];
+
+  async function api(url, corps) {
+    if (EN_LIGNE) return apiEnLigne(url, corps);
+    const opts = { cache: 'no-store', credentials: 'same-origin' };
+    if (corps !== undefined) {
+      opts.method = 'POST';
+      opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+      opts.body = corps;
+    }
+    const r = await fetch(url, opts);
+    if (r.status === 401) throw new NonConnecte();
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+
+  // ---------------------------- En ligne ----------------------------
+  function initSupabase() {
+    if (sb) return true;
+    if (!window.supabase || !SB_CFG.url || !SB_CFG.cle || SB_CFG.cle.indexOf('COLLE') === 0) return false;
+    sb = window.supabase.createClient(SB_CFG.url, SB_CFG.cle);
+    return true;
+  }
+
+  function verifier(r) {
+    if (r.error) {
+      const st = r.error.status || 0;
+      if (st === 401 || r.error.code === 'PGRST301') throw new NonConnecte();
+      if (r.error.code === '42501') throw new Refus(r.error.message);
+      throw new Error(r.error.message || 'erreur');
+    }
+    return r.data;
+  }
+
+  async function moi() {
+    const r = await sb.auth.getSession();
+    const s = r.data && r.data.session;
+    if (!s) throw new NonConnecte();
+    utilisateur = s.user;
+    return s.user;
+  }
+
+  async function apiEnLigne(url, corps) {
+    const p = new URLSearchParams(corps || '');
+    switch (url) {
+      case '/login': {
+        const r = await sb.auth.signInWithPassword({ email: p.get('login'), password: p.get('mdp') });
+        if (r.error) {
+          if (r.error.code === 'email_not_confirmed') throw new Error('confirmer');
+          if (r.error.status === 400) throw new NonConnecte();
+          throw new Error(r.error.message);
+        }
+        return { ok: true };
+      }
+      case '/logout':
+        await sb.auth.signOut();
+        boitier = null; fiche = null; attente = [];
+        return { ok: true };
+      case '/api/config': return configEnLigne();
+      case '/api/etat': return etatEnLigne();
+      case '/api/motdepasse': {
+        const u = await moi();
+        const r1 = await sb.auth.signInWithPassword({ email: u.email, password: p.get('a') });
+        if (r1.error) return { ok: false };
+        const r2 = await sb.auth.updateUser({ password: p.get('n') });
+        if (r2.error) throw new Error(r2.error.message);
+        return { ok: true };
+      }
+      default: return ordreEnLigne(url, p);
+    }
+  }
+
+  async function configEnLigne() {
+    const u = await moi();
+    const liens = verifier(await sb.from('membres').select('boitier_id, role').eq('user_id', u.id));
+    if (!liens || !liens.length) throw new AucunBoitier();
+    const choisi = memoire('pooly-boitier');
+    const l = liens.find((x) => x.boitier_id === choisi) || liens[0];
+    const b = verifier(await sb.from('boitiers').select('id, nom, modele, numero_serie').eq('id', l.boitier_id).maybeSingle());
+    if (!b) throw new AucunBoitier();
+    boitier = { id: b.id, nom: b.nom, modele: b.modele, serie: b.numero_serie, role: l.role };
+    memoire('pooly-boitier', b.id);
+    await chargerFiche();
+    const et = verifier(await sb.from('etats').select('donnees').eq('boitier_id', b.id).maybeSingle());
+    const c = (et && et.donnees && et.donnees.config) || configParDefaut();
+    c.modele = b.nom || b.modele || c.modele;
+    return c;
+  }
+
+  async function chargerFiche() {
+    try {
+      const f = verifier(await sb.from('fiches_piscine').select('donnees').eq('boitier_id', boitier.id).maybeSingle());
+      fiche = f && f.donnees ? f.donnees : null;
+    } catch (x) {
+      if (x instanceof NonConnecte) throw x;
+      fiche = null;
+    }
+  }
+
+  async function etatEnLigne() {
+    if (!boitier) throw new NonConnecte();
+    const r = verifier(await sb.from('etats').select('donnees, maj_le').eq('boitier_id', boitier.id).maybeSingle());
+    const brut = r && r.donnees && r.donnees.etat;
+    const e = Object.assign({ mode: 'pooly', capteurs: {}, sorties: {}, heures: 0, seuil: 5 }, brut || {});
+    e.capteurs = Object.assign({}, e.capteurs);
+    e.sorties = Object.assign({}, e.sorties);
+    const maj = r && r.maj_le ? Date.parse(r.maj_le) : 0;
+    if (!brut) e._jamais = true;
+    else if (Date.now() - maj > 45000) e._depuis = Math.round((Date.now() - maj) / 60000);
+    if (fiche && Array.isArray(fiche.profil)) e.profil = fiche.profil;
+    e.compte = utilisateur ? utilisateur.email : '';
+    // Les commandes pas encore prises en compte par le boîtier restent affichées
+    attente = attente.filter((a) => Date.now() - a.ajoute < 90000 && maj < a.t);
+    attente.forEach((a) => a.patch(e));
+    return e;
+  }
+
+  const ORDRES = {
+    '/api/mode': (p) => {
+      const m = p.get('m');
+      return { type: 'mode', cible: null, valeur: { mode: m }, patch: (e) => { e.mode = m; } };
+    },
+    '/api/sortie': (p) => {
+      const s = p.get('s');
+      const on = !(dernierEtat && dernierEtat.sorties && dernierEtat.sorties[s]);
+      const estPompe = !!(cfg && cfg.sorties.some((x) => x.id === s && x.pompe));
+      return {
+        type: 'sortie', cible: s, valeur: { on: on },
+        patch: (e) => { e.sorties[s] = on ? 1 : 0; if (estPompe) e.mode = 'manuel'; }
+      };
+    },
+    // Sélecteur Off / Auto / On (éclairage, local, surpresseur)
+    '/api/smode': (p) => {
+      const s = p.get('s'), m = p.get('m');
+      return {
+        type: 'sortie', cible: s, valeur: { m: m },
+        patch: (e) => {
+          e.smodes = Object.assign({}, e.smodes); e.smodes[s] = m;
+          if (m === 'on') e.sorties[s] = 1;
+          if (m === 'off') e.sorties[s] = 0;
+        }
+      };
+    },
+    '/api/programme': (p) => {
+      const s = p.get('s'), v = (p.get('v') || '').split(',').map(Number);
+      const estPompe = !!(cfg && cfg.sorties.some((x) => x.id === s && x.pompe));
+      return {
+        type: 'programme', cible: s, valeur: { v: v },
+        patch: (e) => { if (estPompe) e.pp = v; else { e.ps = Object.assign({}, e.ps); e.ps[s] = v; } }
+      };
+    },
+    '/api/entretien': (p) => {
+      const i = Number(p.get('e')), t = p.get('t') ? Number(p.get('t')) : null;
+      return {
+        type: 'entretien', cible: String(i), valeur: { t: t },
+        patch: (e) => { if (!e.ent) return; e.ent = e.ent.slice(); e.ent[i] = i === 2 ? t : e.sp; }
+      };
+    },
+    '/api/profil': (p) => {
+      const v = (p.get('v') || '').split(',').map(Number);
+      return { type: 'profil', cible: null, valeur: { v: v }, patch: (e) => { e.profil = v; } };
+    }
+  };
+
+  async function ordreEnLigne(url, p) {
+    const fab = ORDRES[url];
+    if (!fab || !boitier) throw new Error('commande inconnue');
+    const o = fab(p);
+    await moi();
+    if (url === '/api/profil') await enregistrerFiche(o.valeur.v);
+    // cree_par est rempli par la base (auth.uid()) : on ne l'envoie pas
+    const r = verifier(await sb.from('ordres')
+      .insert({ boitier_id: boitier.id, type: o.type, cible: o.cible, valeur: o.valeur })
+      .select('cree_le').single());
+    attente.push({ t: Date.parse(r.cree_le), ajoute: Date.now(), patch: o.patch });
+    const e = JSON.parse(JSON.stringify(dernierEtat || {}));
+    e.capteurs = e.capteurs || {}; e.sorties = e.sorties || {};
+    o.patch(e);
+    return e;
+  }
+
+  // Colonnes autorisées par la base : insert (boitier_id, donnees), update (donnees, maj_le)
+  async function enregistrerFiche(v) {
+    const donnees = Object.assign({}, fiche || {}, { profil: v });
+    const lignes = verifier(await sb.from('fiches_piscine')
+      .update({ donnees: donnees, maj_le: new Date().toISOString() })
+      .eq('boitier_id', boitier.id).select('boitier_id'));
+    if (!lignes || !lignes.length) {
+      verifier(await sb.from('fiches_piscine').insert({ boitier_id: boitier.id, donnees: donnees }));
+    }
+    fiche = donnees;
+  }
+
+  // ------------------------------------------------------------------
+  //  Connexion
+  // ------------------------------------------------------------------
+  let minuteries = [];
+  function arreterMinuteries() { minuteries.forEach(clearInterval); minuteries = []; }
+  function retirerNav() { const nav = document.querySelector('.px-nav'); if (nav) nav.remove(); }
+
+  function afficherConnexion() {
+    arreterMinuteries();
+    retirerNav();
+    document.title = 'POOLY · Connexion';
+    racine.innerHTML = '';
+    racine.className = 'px-cx';
+    const f = el('form');
+    f.append(el('h1', '', 'POOLY'), el('div', 'sous', 'Pilotage piscine'));
+    const err = el('div', 'px-err'); err.hidden = true;
+    const l1 = el('label', '', EN_LIGNE ? 'Adresse e-mail' : 'Identifiant');
+    const i1 = el('input'); i1.name = 'login'; i1.id = 'px-login'; i1.required = true;
+    i1.type = EN_LIGNE ? 'email' : 'text';
+    i1.autocomplete = EN_LIGNE ? 'email' : 'username';
+    i1.autocapitalize = 'none'; l1.append(i1);
+    const l2 = el('label', '', 'Mot de passe');
+    const i2 = el('input'); i2.name = 'mdp'; i2.id = 'px-mdp'; i2.type = 'password'; i2.autocomplete = 'current-password'; i2.required = true;
+    l2.append(i2);
+    const b = el('button', '', 'Se connecter'); b.type = 'submit';
+    f.append(err, l1, l2, b);
+    if (EN_LIGNE) {
+      const creer = el('button', 'px-second', 'Créer un compte'); creer.type = 'button';
+      creer.onclick = afficherInscription;
+      f.append(creer);
+    }
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      b.disabled = true; b.textContent = 'Connexion…';
+      try {
+        await api('/login', 'login=' + encodeURIComponent(i1.value.trim()) + '&mdp=' + encodeURIComponent(i2.value));
+        demarrer();
+      } catch (x) {
+        if (x instanceof NonConnecte) err.textContent = EN_LIGNE ? 'E-mail ou mot de passe incorrect.' : 'Identifiant ou mot de passe incorrect.';
+        else if (x.message === 'confirmer') err.textContent = 'Confirme d’abord ton adresse e-mail avec le lien reçu par mail.';
+        else err.textContent = EN_LIGNE ? 'Impossible de joindre le serveur POOLY. Vérifie ta connexion internet.' : 'Le boîtier ne répond pas. Vérifie que tu es sur le Wi-Fi de la maison.';
+        err.hidden = false;
+        b.disabled = false; b.textContent = 'Se connecter';
+      }
+    });
+    racine.append(f);
+    i1.focus();
+  }
+
+  // Création d'un compte (site en ligne seulement)
+  function afficherInscription() {
+    arreterMinuteries();
+    retirerNav();
+    document.title = 'POOLY · Créer un compte';
+    racine.innerHTML = '';
+    racine.className = 'px-cx';
+    const f = el('form');
+    f.append(el('h1', '', 'POOLY'), el('div', 'sous', 'Créer un compte'),
+      el('p', '', 'Ensuite, tu relieras ton boîtier avec le numéro de série et le code de son étiquette.'));
+    const err = el('div', 'px-err'); err.hidden = true;
+    const ok = el('p'); ok.hidden = true;
+    const l1 = el('label', '', 'Adresse e-mail');
+    const i1 = el('input'); i1.type = 'email'; i1.autocomplete = 'email'; i1.autocapitalize = 'none'; i1.required = true; l1.append(i1);
+    const l2 = el('label', '', 'Mot de passe (8 caractères minimum)');
+    const i2 = el('input'); i2.type = 'password'; i2.autocomplete = 'new-password'; i2.required = true; l2.append(i2);
+    const l3 = el('label', '', 'Mot de passe, encore une fois');
+    const i3 = el('input'); i3.type = 'password'; i3.autocomplete = 'new-password'; i3.required = true; l3.append(i3);
+    const b = el('button', '', 'Créer mon compte'); b.type = 'submit';
+    const retour = el('button', 'px-second', 'J’ai déjà un compte'); retour.type = 'button';
+    retour.onclick = afficherConnexion;
+    f.append(err, ok, l1, l2, l3, b, retour);
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      err.hidden = true;
+      if (i2.value.length < 8) { err.textContent = 'Le mot de passe doit faire au moins 8 caractères.'; err.hidden = false; return; }
+      if (i2.value !== i3.value) { err.textContent = 'Les deux mots de passe ne sont pas identiques.'; err.hidden = false; return; }
+      b.disabled = true; b.textContent = 'Création…';
+      try {
+        const r = await sb.auth.signUp({
+          email: i1.value.trim(), password: i2.value,
+          options: { emailRedirectTo: location.origin + location.pathname }
+        });
+        if (r.error) throw r.error;
+        if (r.data && r.data.session) { demarrer(); return; }      // confirmation par e-mail désactivée
+        [l1, l2, l3, b].forEach((x) => { x.hidden = true; });
+        ok.textContent = 'Compte créé. Ouvre l’e-mail que POOLY vient de t’envoyer et clique sur le lien pour confirmer ton adresse, puis connecte-toi.';
+        ok.hidden = false;
+        retour.textContent = 'Aller à la connexion';
+      } catch (x) {
+        const t = String((x && x.message) || '');
+        err.textContent = /registered|exists/i.test(t) ? 'Un compte existe déjà avec cette adresse : connecte-toi.'
+          : /password/i.test(t) ? 'Mot de passe refusé : choisis-en un plus long ou plus compliqué.'
+          : /rate|limit/i.test(t) ? 'Trop de tentatives : réessaie dans quelques minutes.'
+          : 'Création impossible : vérifie l’adresse e-mail et ta connexion internet.';
+        err.hidden = false;
+        b.disabled = false; b.textContent = 'Créer mon compte';
+      }
+    });
+    racine.append(f);
+    i1.focus();
+  }
+
+  // Compte en ligne sans boîtier : on le relie avec le numéro de série et le code d'installation
+  function afficherReclamer() {
+    arreterMinuteries();
+    retirerNav();
+    document.title = 'POOLY · Ajouter mon boîtier';
+    racine.innerHTML = '';
+    racine.className = 'px-cx';
+    const f = el('form');
+    f.append(el('h1', '', 'POOLY'), el('div', 'sous', 'Ajouter mon boîtier'),
+      el('p', '', 'Ton compte n’est relié à aucun boîtier. Saisis le numéro de série et le code d’installation inscrits sur l’étiquette du boîtier.'));
+    const err = el('div', 'px-err'); err.hidden = true;
+    const l1 = el('label', '', 'Numéro de série');
+    const i1 = el('input'); i1.required = true; i1.autocapitalize = 'characters'; i1.autocomplete = 'off'; l1.append(i1);
+    const l2 = el('label', '', 'Code d’installation');
+    const i2 = el('input'); i2.required = true; i2.autocomplete = 'off'; l2.append(i2);
+    const b = el('button', '', 'Relier ce boîtier'); b.type = 'submit';
+    const sortir = el('button', 'px-second', 'Se déconnecter'); sortir.type = 'button';
+    sortir.onclick = async () => { try { await api('/logout', ''); } catch (x) { /* déjà sorti */ } afficherConnexion(); };
+    f.append(err, l1, l2, b, sortir);
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      b.disabled = true; b.textContent = 'Vérification…';
+      try {
+        verifier(await sb.rpc('reclamer_boitier', { p_serie: i1.value.trim(), p_code: i2.value.trim() }));
+        demarrer();
+      } catch (x) {
+        if (x instanceof NonConnecte) { afficherConnexion(); return; }
+        err.textContent = 'Numéro de série ou code incorrect, ou boîtier déjà relié à un autre compte.';
+        err.hidden = false;
+        b.disabled = false; b.textContent = 'Relier ce boîtier';
+      }
+    });
+    racine.append(f);
+    i1.focus();
+  }
+
+  // ------------------------------------------------------------------
+  //  Construction des écrans
+  // ------------------------------------------------------------------
+  let cfg = null, dernierEtat = null, meteo = null, ongletActif = 'accueil';
+  const vues = {};
+
+  function normaliserModes(liste) {
+    return (liste || []).map((m) => typeof m === 'string'
+      ? { id: m, nom: (MODES[m] || {}).nom || m, aide: (MODES[m] || {}).aide || '' }
+      : m);
+  }
+
+  function construire() {
+    document.title = 'POOLY';
+    retirerNav();
+    racine.innerHTML = '';
+    racine.className = 'px-app';
+    cfg.modes = normaliserModes(cfg.modes);
+    cfg.principal = cfg.capteurs.find((c) => c.principal) || cfg.capteurs[0];
+
+    const haut = el('div', 'px-haut');
+    const marque = el('div', 'px-marque');
+    marque.innerHTML = LOGO;
+    const nomBloc = el('div');
+    nomBloc.append(el('b', '', 'POOLY'), el('small', '', cfg.modele || ''));
+    marque.append(nomBloc);
+    const etat = el('div', 'px-etat'); etat.id = 'px-etat';
+    etat.append(el('i'), el('span', '', 'Connexion…'));
+    haut.append(marque, etat);
+    racine.append(haut);
+
+    Object.keys(vues).forEach((k) => { delete vues[k]; });
+    vues.accueil = vueAccueil();
+    vues.programmes = cfg.programmes ? vueProgrammes() : null;
+    vues.pooly = vuePooly();
+    vues.piscine = vuePiscine();
+    vues.compte = vueCompte();
+    Object.values(vues).forEach((v) => { if (v) { v.hidden = true; v.style.display = 'none'; racine.append(v); } });
+
+    const nav = el('nav', 'px-nav'); nav.setAttribute('aria-label', 'Rubriques');
+    const rangee = el('div');
+    [['accueil', 'Accueil'], ['programmes', 'Programmes'], ['pooly', 'Pooly'], ['piscine', 'Piscine'], ['compte', 'Compte']].forEach(([id, nom]) => {
+      if (!vues[id]) return;
+      const b = el('button'); b.type = 'button'; b.dataset.onglet = id;
+      b.innerHTML = icone(id); b.append(el('span', '', nom));
+      b.onclick = () => ouvrir(id);
+      rangee.append(b);
+    });
+    rangee.style.gridTemplateColumns = 'repeat(' + rangee.children.length + ',minmax(0,1fr))';
+    nav.append(rangee);
+    document.body.append(nav);
+    ouvrir(ongletActif);
+  }
+
+  function ouvrir(id) {
+    if (!vues[id]) id = 'accueil';
+    ongletActif = id;
+    // hidden ET style.display : certains navigateurs ignoraient hidden seul (correctif du 8 novembre)
+    Object.entries(vues).forEach(([k, v]) => { if (v) { v.hidden = k !== id; v.style.display = k === id ? '' : 'none'; } });
+    document.querySelectorAll('[data-onglet]').forEach((b) => {
+      if (b.dataset.onglet === id) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    });
+    if (dernierEtat) remplirFormulaires(dernierEtat);
+    window.scrollTo(0, 0);
+  }
+
+  // ---------------------------- Accueil -----------------------------
+  function vueAccueil() {
+    const v = el('div', 'px-vue');
+    const p = cfg.principal;
+    const carte = el('div', 'px-carte');
+    carte.append(el('div', 'px-lib', p ? p.nom : ''));
+    const grand = el('div', 'px-grand');
+    const gv = el('b', '', '--'); gv.id = 'px-principal';
+    grand.append(gv, el('span', '', p ? p.unite : ''));
+    const tuiles = el('div', 'px-tuiles');
+    const tuile = (id, titre) => {
+      const d = el('div'); d.append(el('small', '', titre));
+      const s = el('strong', '', '--'); s.id = id; d.append(s); tuiles.append(d);
+    };
+    tuile('px-filtration', 'Filtration aujourd’hui');
+    cfg.capteurs.filter((c) => c !== p).forEach((c) => tuile('px-c-' + c.id, c.nom));
+    if (cfg.lat && cfg.lon && Number(cfg.lat) !== 0 && !cfg.capteurs.some((c) => c.id === 'air')) tuile('px-meteo', 'Air extérieur');
+    carte.append(grand, tuiles);
+
+    const conseils = el('div', 'px-conseils'); conseils.id = 'px-conseils';
+
+    // Accès direct à l'assistant Pooly
+    const demander = el('button', 'px-demander'); demander.type = 'button';
+    demander.innerHTML = ROBOT(26);
+    demander.append(el('span', '', 'Poser une question à Pooly'));
+    demander.onclick = () => { ouvrir('pooly'); const q = $('px-question'); if (q) q.focus(); };
+
+    // ---- Pompe : menu des modes, marche / arrêt seulement en Manuel ----
+    const pompe = cfg.sorties.find((s) => s.pompe);
+    const blocPompe = el('div', 'px-bloc');
+    const hautP = el('div', 'px-entete'), txtP = el('div');
+    const stP = el('small', '', '--'); stP.id = 'px-s-' + (pompe ? pompe.id : 'pompe');
+    txtP.append(el('b', '', pompe ? pompe.nom : 'Pompe'), stP);
+    hautP.append(txtP);
+    if (pompe) {
+      const marche = el('button', 'px-inter'); marche.type = 'button'; marche.id = 'px-pompe-marche';
+      marche.setAttribute('aria-label', 'Marche ou arrêt de la pompe (mode Manuel)');
+      marche.hidden = true;
+      marche.onclick = () => envoyer('/api/sortie', 's=' + pompe.id);
+      hautP.append(marche);
+    }
+    const lm = el('label', '', 'Mode de la pompe');
+    const choix = el('select'); choix.id = 'px-mode';
+    cfg.modes.forEach((m) => choix.append(new Option(m.nom, m.id)));
+    choix.onchange = () => envoyer('/api/mode', 'm=' + choix.value);
+    lm.append(choix);
+    const aide = el('p', 'px-aide'); aide.id = 'px-aide';
+    blocPompe.append(hautP, lm, aide);
+
+    // ---- Autres sorties : sélecteur Off / Auto / On (Off / On pour la lumière du local) ----
+    const sorties = el('div', 'px-liste');
+    cfg.sorties.filter((s) => !s.pompe).forEach((s) => {
+      const bloc = el('div', 'px-bloc'), haut = el('div', 'px-entete'), txt = el('div');
+      const st = el('small', '', '--'); st.id = 'px-s-' + s.id;
+      txt.append(el('b', '', s.nom), st);
+      haut.append(txt);
+      bloc.append(haut);
+      if (cfg.smodes) {
+        const positions = s.type === 'simple' ? ['off', 'on'] : ['off', 'auto', 'on'];
+        const seg = el('div', 'px-modes');
+        seg.setAttribute('role', 'group');
+        seg.setAttribute('aria-label', s.nom);
+        seg.style.gridTemplateColumns = 'repeat(' + positions.length + ',minmax(0,1fr))';
+        positions.forEach((m) => {
+          const b = el('button', '', SMODES_NOMS[m]); b.type = 'button';
+          b.dataset.smode = s.id; b.dataset.v = m;
+          b.onclick = () => envoyer('/api/smode', 's=' + s.id + '&m=' + m);
+          seg.append(b);
+        });
+        bloc.append(seg);
+      } else {                                   // ancien boîtier : simple interrupteur
+        const b = el('button', 'px-inter'); b.type = 'button'; b.dataset.sortie = s.id;
+        b.setAttribute('aria-label', s.nom);
+        b.onclick = () => envoyer('/api/sortie', 's=' + s.id);
+        haut.append(b);
+      }
+      sorties.append(bloc);
+    });
+
+    v.append(carte, el('div', 'px-titre', 'Assistant'), conseils, demander,
+      el('div', 'px-titre', 'Pompe'), blocPompe, el('div', 'px-titre', 'Sorties'), sorties);
+
+    if (cfg.cameras && cfg.cameras.length) {
+      v.append(el('div', 'px-titre', 'Caméra'));
+      cfg.cameras.forEach((c) => {
+        const d = el('div', 'px-cam'), img = el('img'), legende = el('p', '', c.nom);
+        img.src = c.url; img.alt = c.nom;
+        img.onerror = () => { legende.textContent = c.nom + ' · caméra injoignable'; };
+        d.append(img, legende);
+        v.append(d);
+      });
+    }
+    return v;
+  }
+
+  // --------------------------- Programmes ---------------------------
+  function vueProgrammes() {
+    const v = el('div', 'px-vue');
+    v.append(el('div', 'px-titre', 'Programmes horaires'));
+
+    const bloc = el('form', 'px-bloc');
+    bloc.append(el('h3', '', 'Filtration en mode Auto'),
+      el('p', '', 'Deux plages par jour. Mets la même heure au début et à la fin pour ne pas utiliser une plage.'));
+    const entrees = [];
+    [1, 2].forEach((n) => {
+      const ligne = el('div', 'px-deux');
+      const [l1, d] = champ('Plage ' + n + ' : début', 'time', 'px-pp-d' + n);
+      const [l2, f] = champ('Plage ' + n + ' : fin', 'time', 'px-pp-f' + n);
+      ligne.append(l1, l2); bloc.append(ligne); entrees.push(d, f);
+    });
+    const total = el('p'); total.id = 'px-pp-total';
+    const msg = el('div', 'px-msg'); msg.setAttribute('role', 'status');
+    const ok = el('button', 'px-ok', 'Enregistrer'); ok.type = 'submit';
+    bloc.append(total, msg, ok);
+    const majTotal = () => {
+      const m = entrees.map((i) => versMinutes(i.value));
+      if (m.some((x) => x === null)) { total.textContent = ''; return; }
+      const h = (dureePlage(m[0], m[1]) + dureePlage(m[2], m[3])) / 60;
+      total.textContent = 'Total : ' + nb(h, h % 1 ? 1 : 0) + ' h de filtration par jour.';
+    };
+    entrees.forEach((i) => i.addEventListener('input', majTotal));
+    bloc.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const m = entrees.map((i) => versMinutes(i.value));
+      if (m.some((x) => x === null)) { message(msg, 'Remplis les quatre heures.', true); return; }
+      const pompe = cfg.sorties.find((s) => s.pompe);
+      if (await envoyer('/api/programme', 's=' + pompe.id + '&v=' + encodeURIComponent(m.join(',')))) {
+        message(msg, dernierEtat.mode === 'auto' ? 'Horaires enregistrés.' : 'Horaires enregistrés. Ils s’appliquent quand la pompe est en mode Auto.');
+      } else message(msg, texteEchec(), true);
+    });
+    v.append(bloc);
+
+    // Horaires des autres sorties : utilisés quand leur sélecteur est sur Auto
+    cfg.sorties.filter((s) => !s.pompe && s.type !== 'simple').forEach((s) => {
+      const f = el('form', 'px-bloc');
+      f.append(el('h3', '', s.nom));
+      const ligne = el('div', 'px-deux');
+      const [l1, d] = champ('Allumage', 'time', 'px-ps-d-' + s.id);
+      const [l2, fi] = champ('Extinction', 'time', 'px-ps-f-' + s.id);
+      ligne.append(l1, l2);
+      const note = el('p', '', 'Ces horaires s’appliquent quand le sélecteur est sur « Auto » dans l’accueil.');
+      const m2 = el('div', 'px-msg'); m2.setAttribute('role', 'status');
+      const b = el('button', 'px-ok', 'Enregistrer'); b.type = 'submit';
+      f.append(ligne, note, m2, b);
+      f.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const dm = versMinutes(d.value), fm = versMinutes(fi.value);
+        if (dm === null || fm === null) { message(m2, 'Indique l’heure d’allumage et d’extinction.', true); return; }
+        const enAuto = !!(dernierEtat && dernierEtat.smodes && dernierEtat.smodes[s.id] === 'auto');
+        if (await envoyer('/api/programme', 's=' + s.id + '&v=' + encodeURIComponent([enAuto ? 1 : 0, dm, fm].join(',')))) {
+          message(m2, 'Horaires enregistrés : ' + hhmm(dm) + ' à ' + hhmm(fm) + (enAuto ? '.' : '. Mets le sélecteur sur « Auto » pour les utiliser.'));
+        } else message(m2, texteEchec(), true);
+      });
+      v.append(f);
+    });
+    return v;
+  }
+
+  // ------------------------------------------------------------------
+  //  Assistant Pooly : questions / réponses
+  // ------------------------------------------------------------------
+  // Réponses validées par le pisciniste (base du 8 novembre 2026).
+  // Format d'une réponse : une chaîne = un paragraphe ; { ul: [...] } ou { ol: [...] } = une liste.
+  // **texte** = en gras. perso(e) = phrase adaptée à la piscine (fiche + état du boîtier), ou ''.
+  const THEMES = [
+    { id: 'eau', nom: 'L’eau' },
+    { id: 'produits', nom: 'Les produits' },
+    { id: 'filtration', nom: 'La filtration' },
+    { id: 'saisons', nom: 'Les saisons' },
+    { id: 'pannes', nom: 'Les pannes' },
+    { id: 'budget', nom: 'Le budget' }
+  ];
+
+  const eauDe = (e) => (e && e.capteurs && e.capteurs.eau !== null && e.capteurs.eau !== undefined) ? Number(e.capteurs.eau) : null;
+  const profilDe = (e) => (e && e.profil) || [];
+  const nomMode = (e) => (MODES[e.mode] || {}).nom || e.mode;
+  const persoChoc = (e) => conseilChoc(e).trim();
+
+  const BASE = [
+    // ------------------------------ L'eau ------------------------------
+    {
+      id: 'verte', theme: 'eau', q: 'Mon eau est verte, je fais quoi ?',
+      mots: ['eau verte', 'verte', 'vert', 'algue', 'algues', 'verdatre'],
+      r: ['L’eau verte, ce sont des **algues**. Elles arrivent quand l’un de ces points lâche :',
+        { ul: ['**pas assez de désinfectant** ;', '**pH mal réglé** (le chlore ne marche plus bien au-dessus de 7,6) ;',
+          '**pas assez d’heures de filtration** ;', '**filtre encrassé** ou **préfiltre de la pompe encrassé**.'] },
+        'À faire : contrôle l’eau (pH et désinfectant), nettoie le préfiltre, fais un contre-lavage, corrige le pH, puis un **traitement choc** avec la filtration en continu.'],
+      perso: persoChoc
+    },
+    {
+      id: 'trouble', theme: 'eau', q: 'Mon eau est trouble, pourquoi ?',
+      mots: ['trouble', 'troublee', 'laiteuse', 'blanche', 'opaque', 'pas claire', 'claire', 'louche'],
+      r: ['Le plus souvent : **filtre encrassé**, **préfiltre encrassé** ou **pas assez d’heures de filtration**.',
+        'Attention : une eau trouble **va virer au vert** si on ne fait rien.',
+        'À faire : nettoie le préfiltre, fais un contre-lavage, puis vérifie que la filtration tourne assez longtemps.'],
+      perso: (e) => {
+        const eau = eauDe(e);
+        if (eau === null) return '';
+        const h = Math.round(eau / 2);
+        return 'Ton eau est à ' + nb(eau, 1) + ' °C : il faut environ **' + h + ' h** de filtration par jour.' +
+          (e.mode === 'pooly' ? ' Ton mode Thermo s’en charge.' : ' Ta pompe est en mode ' + nomMode(e) + ' : vérifie que tu filtres assez.');
+      }
+    },
+    {
+      id: 'chloramine', theme: 'eau', q: 'L’eau pique les yeux et sent fort le chlore',
+      mots: ['pique', 'piquer', 'yeux', 'oeil', 'odeur', 'sent', 'sent le chlore', 'chloramine', 'chloramines', 'irrite', 'yeux rouges', 'gratte'],
+      r: ['Ce n’est pas trop de chlore : c’est **la chloramine**. Le chlore s’est combiné à la sueur, la crème solaire ou l’urine des baigneurs. Ce chlore « usé » pique les yeux, sent fort, et ne désinfecte presque plus.',
+        'Paradoxe : il faut **rajouter** du chlore.',
+        'À faire : un **traitement choc** le soir, filtration en continu. Si ça revient souvent, renouvelle une partie de l’eau. Pour l’éviter : une douche avant la baignade.'],
+      perso: persoChoc
+    },
+    {
+      id: 'orage', theme: 'eau', q: 'L’eau devient verte après un orage',
+      mots: ['orage', 'orages', 'pluie', 'pleut', 'plu', 'tempete', 'averse'],
+      r: ['La pluie apporte des saletés et des spores d’algues. Elle fait souvent baisser le désinfectant et bouger le pH.',
+        'À faire : après l’orage, contrôle le pH et le désinfectant, nettoie le préfiltre, et fais un traitement choc si l’eau se trouble.'],
+      perso: persoChoc
+    },
+    // ---------------------------- Les produits ----------------------------
+    {
+      id: 'phmonte', theme: 'produits', q: 'Mon pH monte tout le temps',
+      mots: ['ph monte', 'monte tout le temps', 'ph remonte', 'remonte', 'tac', 'alcalinite', 'ph haut', 'ph eleve', 'ph trop haut'],
+      r: ['Cause la plus fréquente : un **TAC trop haut** (le TAC, c’est le « pouvoir tampon » de l’eau). Un TAC trop élevé fait remonter le pH sans arrêt.',
+        'À faire : mesure le TAC. S’il est trop haut, on le fait baisser progressivement avec du pH moins.',
+        'Un électrolyseur au sel fait aussi monter le pH : c’est normal, il faut corriger plus souvent.'],
+      perso: (e) => profilDe(e)[P_DESINF] === DESINF.ELECTROLYSEUR
+        ? 'Tu as un **électrolyseur** : une remontée du pH est normale, contrôle-le au moins une fois par semaine.' : ''
+    },
+    {
+      id: 'phideal', theme: 'produits', q: 'Quel pH viser ?',
+      mots: ['ph', 'quel ph', 'ph ideal', 'viser', 'ideal', 'bon ph', 'valeur', 'acide', 'basique'],
+      r: [{ ul: ['**Entre 7,0 et 7,4** dans la plupart des piscines.', '**7,6** pour un enduit **silico-marbreux**.', '**Jusqu’à 7,8** avec du **brome**.'] }],
+      perso: (e) => {
+        const pr = profilDe(e);
+        let t = '';
+        if (pr[P_DESINF] === DESINF.BROME) t = 'Tu traites au **brome** : tu peux viser jusqu’à **7,8**.';
+        else if (pr[P_DESINF]) t = 'Pour ta piscine : vise **entre 7,0 et 7,4**.';
+        if (t && pr[P_PH] === 2) t += ' Règle ton régulateur de pH sur cette valeur.';
+        return t;
+      }
+    },
+    {
+      id: 'choc', theme: 'produits', q: 'Quand et comment faire un traitement choc ?',
+      mots: ['choc', 'traitement choc', 'chlore choc', 'surchloration', 'surchlorer', 'chloration'],
+      r: ['**Le soir ou tôt le matin** : le soleil détruit le chlore.',
+        'Passe la filtration **en continu**. Dose selon la notice du produit et le volume de ta piscine.'],
+      perso: (e) => {
+        const t = persoChoc(e);
+        return (t ? t + ' ' : '') + 'Le bouton « mode choc » arrive avec la 1.5 : en attendant, mets la pompe en mode **Manuel**, en marche, pour filtrer en continu.';
+      }
+    },
+    {
+      id: 'sel', theme: 'produits', q: 'Combien de sel pour mon électrolyseur ?',
+      mots: ['sel', 'taux de sel', 'electrolyseur', 'electrolyse', 'salee', 'sale'],
+      r: ['Toujours **le taux de sel préconisé par le fabricant** de ton électrolyseur : il est dans sa notice.',
+        'Contrôle-le régulièrement : trop peu, l’électrolyseur ne produit plus ; trop, il s’abîme.'],
+      perso: (e) => {
+        const d = profilDe(e)[P_DESINF];
+        return d && d !== DESINF.ELECTROLYSEUR ? 'D’après ta fiche, ta piscine n’a pas d’électrolyseur.' : '';
+      }
+    },
+    {
+      id: 'baignade', theme: 'produits', q: 'Combien de temps avant de me baigner après un produit ?',
+      mots: ['baigner', 'baignade', 'se baigner', 'nager', 'attendre', 'apres produit', 'combien de temps', 'delai'],
+      r: ['**24 heures** après avoir mis le produit.']
+    },
+    // --------------------------- La filtration ---------------------------
+    {
+      id: 'heures', theme: 'filtration', q: 'Je dois filtrer combien d’heures par jour ?',
+      mots: ['heures', 'heure', 'combien d heures', 'duree', 'filtrer', 'filtration', 'temps de filtration', 'tourner'],
+      r: ['Règle du pisciniste : **température de l’eau ÷ 2** (eau à 26 °C → 13 h).',
+        'C’est ce que fait le mode **Thermo** de Pooly, tout seul. Au-dessus de 28 °C, on peut filtrer en continu.'],
+      perso: (e) => {
+        const eau = eauDe(e);
+        if (eau === null) return '';
+        return 'Ton eau est à ' + nb(eau, 1) + ' °C : environ **' + Math.round(eau / 2) + ' h** par jour.' +
+          (e.mode === 'pooly' ? ' Ton mode Thermo le fait déjà.' : ' Ta pompe est en mode ' + nomMode(e) + ' : passe en Thermo pour que Pooly calcule tout seul.');
+      }
+    },
+    {
+      id: 'journuit', theme: 'filtration', q: 'Filtrer le jour ou la nuit ?',
+      mots: ['nuit', 'jour', 'journee', 'quand filtrer', 'moment', 'matin', 'soir'],
+      r: ['Plutôt **en journée, aux heures chaudes** : c’est là que les algues se développent et que le désinfectant s’use.',
+        'Le mode Thermo centre la filtration sur 14 h.']
+    },
+    {
+      id: 'pression', theme: 'filtration', q: 'La pression du filtre monte',
+      mots: ['pression', 'manometre', 'bar', 'pression monte', 'pression haute', 'filtre encrasse', 'encrasse'],
+      r: ['Le filtre est encrassé. Repère la pression quand le filtre est propre : quand elle monte de **0,3 à 0,5 bar** au-dessus, c’est l’heure d’un contre-lavage.']
+    },
+    {
+      id: 'contrelavage', theme: 'filtration', q: 'Comment faire un contre-lavage ?',
+      mots: ['contre lavage', 'contrelavage', 'lavage', 'laver', 'rincage', 'vanne', 'vanne 6 voies', 'nettoyer le filtre', 'backwash'],
+      r: [{ ol: ['**Arrête la pompe** (toujours avant de tourner la vanne).',
+        'Vanne sur **Contre-lavage**, remets la pompe 2 à 3 minutes, jusqu’à ce que l’eau du voyant soit claire.',
+        'Arrête la pompe, vanne sur **Rinçage**, 30 secondes.',
+        'Arrête la pompe, vanne sur **Filtration**, relance.'] },
+        'Pooly te rappelle le contre-lavage selon les heures de filtration (onglet Piscine).'],
+      perso: (e) => profilDe(e)[P_FILTRE] === FILTRE.CARTOUCHE
+        ? 'Tu as un **filtre à cartouche** : pas de contre-lavage. On sort la cartouche et on la nettoie, selon sa notice.' : ''
+    },
+    // ---------------------------- Les saisons ----------------------------
+    {
+      id: 'ouvrir', theme: 'saisons', q: 'Quand ouvrir ma piscine ?',
+      mots: ['ouvrir', 'ouverture', 'remise en route', 'remettre en route', 'printemps', 'debut de saison', 'redemarrer'],
+      r: ['Quand l’eau **dépasse 15 °C**.'],
+      perso: (e) => {
+        const eau = eauDe(e);
+        if (eau === null) return '';
+        return 'Ton eau est à ' + nb(eau, 1) + ' °C : ' + (eau > 15 ? 'tu peux ouvrir.' : 'encore un peu de patience.');
+      }
+    },
+    {
+      id: 'hivernage', theme: 'saisons', q: 'Hivernage actif ou passif ?',
+      mots: ['hivernage', 'hiverner', 'hiver', 'actif', 'passif', 'fermer', 'fermeture', 'fin de saison'],
+      r: [{ ul: ['**Actif** : la filtration continue, réduite (quelques heures par jour), avec le **mode Hors-gel** de Pooly. L’eau reste saine, la remise en route au printemps est facile. Adapté aux hivers doux comme sur la côte.',
+        '**Passif** : on arrête tout. Traitement choc + produit d’hivernage, niveau d’eau baissé sous les skimmers et les refoulements, canalisations et filtre vidangés, bouchons et flotteurs d’hivernage, bâche. Pour les régions où il gèle souvent.'] },
+        'On hiverne quand l’eau passe **sous 12 °C** environ.'],
+      perso: (e) => {
+        const eau = eauDe(e);
+        let t = eau !== null ? 'Ton eau est à ' + nb(eau, 1) + ' °C' + (eau < 12 ? ' : c’est la période.' : '.') : '';
+        if (e && e.mode === 'horsgel') t += (t ? ' ' : '') + 'Ta pompe est déjà en mode **Hors-gel**.';
+        return t;
+      }
+    },
+    {
+      id: 'gel', theme: 'saisons', q: 'Comment protéger ma piscine du gel ?',
+      mots: ['gel', 'geler', 'gele', 'froid', 'hors gel', 'horsgel', 'glace', 'canalisations'],
+      r: ['En hivernage actif : mets la pompe en **mode Hors-gel**. Elle tourne en continu dès que l’eau descend sous 5 °C.',
+        '**Jamais en mode Off** par grand froid : Pooly t’alerte si c’est le cas.'],
+      perso: (e) => {
+        if (!e) return '';
+        if (e.mode === 'horsgel') return 'Ta pompe est en mode **Hors-gel** : tu es protégé.';
+        if (e.mode === 'off') return 'Attention : ta pompe est en **arrêt forcé**. Passe-la en mode Hors-gel dès que les nuits deviennent froides.';
+        return 'Ta pompe est en mode ' + nomMode(e) + ' : passe-la en **Hors-gel** quand l’hiver arrive.';
+      }
+    },
+    // ----------------------------- Les pannes -----------------------------
+    {
+      id: 'desamorce', theme: 'pannes', q: 'Ma pompe se désamorce',
+      mots: ['desamorce', 'desamorcer', 'amorcage', 'amorce', 'prise d air', 'air', 'bulles', 'aspire', 'pas de debit', 'debit'],
+      r: ['Presque toujours **une prise d’air et/ou une fuite** sur l’aspiration.',
+        'Vérifie aussi : le **niveau d’eau** (assez haut dans les skimmers), le **couvercle et le joint du préfiltre**, un **panier de skimmer bouché**.'],
+      perso: (e) => e && e.defautDebit ? 'Pooly vient justement d’**arrêter ta pompe faute de débit** : commence par ces vérifications, puis change de mode pour la relancer.' : ''
+    },
+    {
+      id: 'bruit', theme: 'pannes', q: 'La pompe fait du bruit / ne démarre plus',
+      mots: ['bruit', 'bruyante', 'fait du bruit', 'grince', 'siffle', 'vibre', 'demarre plus', 'demarre pas', 'ne demarre', 'roulement', 'panne', 'chauffe'],
+      r: ['Un bruit qui change, c’est souvent un **problème de roulement**, ou autre.',
+        '**Fais contrôler par un professionnel** : continuer à la faire tourner peut l’abîmer.']
+    },
+    {
+      id: 'fuite', theme: 'pannes', q: 'Mon niveau d’eau baisse, j’ai une fuite ?',
+      mots: ['fuite', 'fuit', 'niveau', 'niveau baisse', 'baisse', 'perd de l eau', 'perd', 'seau', 'evaporation', 'vide'],
+      r: ['Fais d’abord **le test du seau** :',
+        { ol: ['Pose un seau sur une marche de la piscine (ou au bord) et remplis-le **au même niveau que l’eau du bassin**.',
+          'Marque les deux niveaux et attends **24 à 48 h**.',
+          'Si **la piscine** a baissé plus que le seau : risque de fuite. Si les deux ont baissé pareil : c’est de l’évaporation.'] },
+        'En cas de doute : **contacte un professionnel**.']
+    },
+    // ------------------------------ Le budget ------------------------------
+    {
+      id: 'electricite', theme: 'budget', q: 'Combien me coûte ma piscine en électricité ?',
+      mots: ['electricite', 'cout', 'coute', 'combien ca coute', 'prix', 'kwh', 'consommation', 'consomme', 'facture', 'budget', 'euros'],
+      r: ['Pooly le calcule à partir de **la puissance de ta pompe**, des **heures de filtration** et du **prix du kWh**.'],
+      perso: (e) => {
+        if (e && e.coutJour !== undefined) {
+          return 'Aujourd’hui : environ **' + nb(e.kwhJour, 1) + ' kWh**, soit **' + nb(e.coutJour, 2) + ' €**' +
+            ' (environ ' + nb(e.coutJour * 30, 0) + ' € par mois à ce rythme).';
+        }
+        return 'Le calcul s’affichera quand la puissance de ta pompe et le prix du kWh seront renseignés.';
+      }
+    }
+  ];
+
+  // ---- Recherche : mots-clés, sans accents, tolérante aux fautes de frappe ----
+  const MOTS_VIDES = new Set(('a ai as au aux avec ca ce ces c d de des dois doit du elle en est et faire fait faut il ils j je l la le les leur ' +
+    'm ma me mes moi mon n ne on ou par pas peut pour pourquoi qu que quel quelle quelles quels qui quoi s sa se ses si son sur ' +
+    't ta te tes toi ton tu un une vous y comment combien quand est-ce piscine bonjour salut merci stp svp').split(' '));
+
+  function normaliser(t) {
+    return String(t || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+      .replace(/[’'`]/g, ' ').replace(/[-_]/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  // Nombre de fautes pour passer de a à b (lettre en trop, en moins, changée, ou deux lettres inversées)
+  function distance(a, b) {
+    if (Math.abs(a.length - b.length) > 2) return 9;
+    const d = [];
+    for (let i = 0; i <= a.length; i++) { d[i] = [i]; }
+    for (let j = 0; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++) {
+      for (let j = 1; j <= b.length; j++) {
+        const cout = a[i - 1] === b[j - 1] ? 0 : 1;
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cout);
+        if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+    return d[a.length][b.length];
+  }
+  function motsDe(t) { return normaliser(t).split(' ').filter((m) => m && !MOTS_VIDES.has(m)); }
+  function proches(a, b) {
+    if (a === b) return 2;
+    if (a.length >= 4 && b.length >= 4 && (a.startsWith(b) || b.startsWith(a))) return 1.5;
+    const tol = Math.min(a.length, b.length) >= 7 ? 2 : Math.min(a.length, b.length) >= 4 ? 1 : 0;
+    return tol && distance(a, b) <= tol ? 1.2 : 0;
+  }
+
+  BASE.forEach((x) => { x._mots = x.mots.map(normaliser); x._q = motsDe(x.q); });
+
+  function chercher(question) {
+    const phrase = ' ' + normaliser(question) + ' ';
+    const mots = motsDe(question);
+    if (!mots.length) return [];
+    return BASE.map((x) => {
+      let score = 0;
+      x._mots.forEach((k) => {
+        if (k.indexOf(' ') >= 0) { if (phrase.indexOf(' ' + k + ' ') >= 0) score += 3; return; }
+        let best = 0;
+        mots.forEach((m) => { best = Math.max(best, proches(m, k)); });
+        score += best;
+      });
+      x._q.forEach((k) => { if (mots.some((m) => proches(m, k) >= 1.5)) score += 0.5; });
+      return { x: x, score: score };
+    }).filter((r) => r.score >= 1.2).sort((a, b) => b.score - a.score);
+  }
+
+  // Écrit un texte avec **gras** sans jamais interpréter de HTML
+  function riche(parent, txt) {
+    String(txt).split(/\*\*(.+?)\*\*/).forEach((morceau, i) => {
+      if (!morceau) return;
+      parent.append(i % 2 ? el('strong', '', morceau) : document.createTextNode(morceau));
+    });
+  }
+
+  function bullePooly(x, autres) {
+    const b = el('div', 'px-bulle pooly');
+    b.append(el('h4', '', x.q));
+    x.r.forEach((bloc) => {
+      if (typeof bloc === 'string') { const p = el('p'); riche(p, bloc); b.append(p); return; }
+      const liste = el(bloc.ol ? 'ol' : 'ul');
+      (bloc.ol || bloc.ul).forEach((t) => { const li = el('li'); riche(li, t); liste.append(li); });
+      b.append(liste);
+    });
+    let perso = '';
+    try { perso = x.perso && dernierEtat && !dernierEtat._jamais ? x.perso(dernierEtat) : ''; } catch (err) { perso = ''; }
+    if (perso) {
+      const d = el('div', 'px-perso');
+      d.append(el('b', '', 'Pour ta piscine'));
+      const s = el('span'); riche(s, perso); d.append(s);
+      b.append(d);
+    }
+    if (autres && autres.length) {
+      const a = el('div', 'px-aussi');
+      a.append(el('small', '', 'Ça peut aussi t’aider :'));
+      autres.forEach((o) => {
+        const btn = el('button', 'px-question', o.q); btn.type = 'button';
+        btn.onclick = () => repondre(o.q, o);
+        a.append(btn);
+      });
+      b.append(a);
+    }
+    return b;
+  }
+
+  function repondre(question, force) {
+    const fil = $('px-fil');
+    if (!fil) return;
+    fil.append(el('div', 'px-bulle moi', question));
+    let rep;
+    if (force) rep = bullePooly(force, []);
+    else {
+      const res = chercher(question);
+      if (!res.length) {
+        rep = el('div', 'px-bulle pooly');
+        rep.append(el('p', '', 'Je n’ai pas encore la réponse à cette question.'),
+          el('p', '', 'Essaie avec d’autres mots (par exemple « eau verte », « contre-lavage », « gel »), choisis une question plus bas, ou demande à ton pisciniste.'));
+      } else {
+        const meilleur = res[0];
+        const autres = res.slice(1, 3).filter((r) => r.score >= meilleur.score * 0.6).map((r) => r.x);
+        rep = bullePooly(meilleur.x, autres);
+      }
+    }
+    fil.append(rep);
+    while (fil.children.length > 8) fil.removeChild(fil.firstChild);   // on garde les 4 dernières questions
+    rep.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function vuePooly() {
+    const v = el('div', 'px-vue');
+    const tete = el('div', 'px-robot');
+    tete.innerHTML = ROBOT(56);
+    const t = el('div');
+    t.append(el('b', '', 'Pooly'), el('small', '', 'Ton assistant piscine. Pose-moi une question, je te réponds.'));
+    tete.append(t);
+
+    const form = el('form', 'px-cherche');
+    form.setAttribute('role', 'search');
+    const q = el('input'); q.type = 'search'; q.id = 'px-question';
+    q.placeholder = 'Ex. : mon eau est verte';
+    q.setAttribute('aria-label', 'Ta question à Pooly');
+    q.autocomplete = 'off'; q.enterKeyHint = 'search';
+    const go = el('button', '', 'Demander'); go.type = 'submit';
+    form.append(q, go);
+    form.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const texte = q.value.trim();
+      if (!texte) { q.focus(); return; }
+      repondre(texte);
+      q.value = '';
+      q.blur();                                  // referme le clavier du téléphone
+    });
+
+    const fil = el('div', 'px-fil'); fil.id = 'px-fil';
+    fil.setAttribute('aria-live', 'polite');
+
+    const puces = el('div', 'px-puces');
+    puces.setAttribute('role', 'group');
+    puces.setAttribute('aria-label', 'Thèmes');
+    const liste = el('div', 'px-questions');
+    let theme = THEMES[0].id;
+    const majListe = () => {
+      puces.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.theme === theme));
+      liste.innerHTML = '';
+      BASE.filter((x) => x.theme === theme).forEach((x) => {
+        const b = el('button', 'px-question', x.q); b.type = 'button';
+        b.onclick = () => repondre(x.q, x);
+        liste.append(b);
+      });
+    };
+    THEMES.forEach((th) => {
+      const b = el('button', 'px-puce', th.nom); b.type = 'button'; b.dataset.theme = th.id;
+      b.onclick = () => { theme = th.id; majListe(); };
+      puces.append(b);
+    });
+    majListe();
+
+    v.append(tete, form, fil, el('div', 'px-titre', 'Questions fréquentes'), puces, liste,
+      el('p', 'px-pied', 'Pooly donne des conseils généraux. En cas de doute sur ta pompe, ton électricité ou un produit, demande à un professionnel.'));
+    return v;
+  }
+
+  // ---------------------------- Piscine -----------------------------
+  function vuePiscine() {
+    const v = el('div', 'px-vue');
+    if (cfg.profil) {
+      v.append(el('div', 'px-titre', 'Ma piscine'));
+      const f = el('form', 'px-bloc');
+      f.append(el('p', '', 'Ces informations servent à l’assistant pour te donner des conseils adaptés.'));
+      const [lv, vol] = champ('Volume d’eau (m³)', 'number', 'px-profil-0');
+      vol.min = 1; vol.max = 2000; vol.inputMode = 'numeric';
+      f.append(lv);
+      Object.keys(CHOIX).forEach((k) => {
+        const c = CHOIX[k];
+        const l = el('label', '', c.nom), s = el('select'); s.id = 'px-profil-' + k;
+        s.append(new Option('Non renseigné', '0'));
+        c.options.forEach((o, i) => s.append(new Option(o, String(i + 1))));
+        l.append(s); f.append(l);
+      });
+      const msg = el('div', 'px-msg'); msg.setAttribute('role', 'status');
+      const ok = el('button', 'px-ok', 'Enregistrer'); ok.type = 'submit';
+      f.append(msg, ok);
+      f.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const valeurs = [0, 0, 0, 0, 0, 0, 0, 0];
+        const vv = Math.round(Number(vol.value) || 0);
+        if (vol.value && (vv < 1 || vv > 2000)) { message(msg, 'Le volume doit être entre 1 et 2000 m³.', true); return; }
+        valeurs[P_VOLUME] = vv;
+        Object.keys(CHOIX).forEach((k) => { valeurs[k] = Number($('px-profil-' + k).value); });
+        if (dernierEtat && dernierEtat.profil) valeurs[7] = dernierEtat.profil[7] || 0;
+        if (await envoyer('/api/profil', 'v=' + encodeURIComponent(valeurs.join(',')))) message(msg, 'Fiche enregistrée.');
+        else message(msg, EN_LIGNE ? 'Fiche non enregistrée : seul le propriétaire peut la modifier, ou la connexion a échoué.' : texteEchec(), true);
+      });
+      v.append(f);
+    }
+
+    if (cfg.entretien) {
+      v.append(el('div', 'px-titre', 'Entretien'));
+      const liste = el('div', 'px-liste'); liste.id = 'px-entretien';
+      v.append(liste);
+    }
+    return v;
+  }
+
+  function afficherEntretien(e) {
+    const liste = $('px-entretien');
+    if (!liste || !e.ent) return;
+    liste.innerHTML = '';
+    entretiens(e.profil).forEach((x, i) => {
+      if (!x) return;
+      const ligne = el('div', 'px-ligne'), txt = el('div'), st = el('small');
+      if (x.heures) {
+        const h = Math.max(0, (e.sp - e.ent[i]) / 3600);
+        st.textContent = Math.round(h) + ' h de filtration depuis le dernier · tous les ' + x.heures + ' h';
+        if (h >= x.heures) st.className = 'du';
+      } else if (!e.ent[2]) {
+        st.textContent = 'Date du dernier changement inconnue · tous les ' + x.ans + ' ans';
+      } else {
+        const d = new Date(e.ent[2] * 1000);
+        const prochain = new Date(d); prochain.setFullYear(d.getFullYear() + x.ans);
+        st.textContent = 'Fait le ' + d.toLocaleDateString('fr-FR') + ' · prochain en ' + prochain.getFullYear();
+        if (Date.now() >= prochain.getTime()) st.className = 'du';
+      }
+      txt.append(el('b', '', x.nom), st);
+      const fait = el('button', 'px-fait', 'Fait'); fait.type = 'button';
+      fait.onclick = () => {
+        if (!confirm('Enregistrer « ' + x.nom.toLowerCase() + ' » comme fait aujourd’hui ?')) return;
+        envoyer('/api/entretien', 'e=' + i + (i === 2 ? '&t=' + Math.floor(Date.now() / 1000) : ''));
+      };
+      ligne.append(txt, fait);
+      liste.append(ligne);
+    });
+    if (e.profil && !e.profil[P_FILTRE]) liste.append(el('div', 'px-aide', 'Choisis ton type de filtre dans la fiche pour des rappels adaptés.'));
+  }
+
+  // ----------------------------- Compte -----------------------------
+  const ROLES = { proprietaire: 'propriétaire', famille: 'famille', location: 'location' };
+
+  function vueCompte() {
+    const v = el('div', 'px-vue');
+    v.append(el('div', 'px-titre', 'Compte'));
+    const info = el('div', 'px-bloc');
+    const qui = el('h3'); qui.id = 'px-qui';
+    const boitierTxt = el('p', '', (cfg.modele || 'POOLY') + (cfg.version ? ' · boîtier ' + cfg.version : '') + ' · interface ' + WEB_VERSION);
+    info.append(qui, boitierTxt);
+    if (EN_LIGNE && boitier) {
+      info.append(el('p', '', 'Accès : ' + (ROLES[boitier.role] || boitier.role) + (boitier.serie ? ' · n° ' + boitier.serie : '')));
+    }
+    const heure = el('p'); heure.id = 'px-heure';
+    info.append(heure);
+
+    const mini = EN_LIGNE ? 8 : 6, maxi = EN_LIGNE ? 72 : 22;
+    const f = el('form', 'px-bloc');
+    f.append(el('h3', '', 'Changer mon mot de passe'));
+    const champs = [['px-mdp-a', 'Mot de passe actuel', 'current-password'],
+                    ['px-mdp-n', EN_LIGNE ? 'Nouveau (8 caractères minimum)' : 'Nouveau (6 à 22 caractères)', 'new-password'],
+                    ['px-mdp-c', 'Nouveau, encore une fois', 'new-password']].map(([id, txt, ac]) => {
+      const [l, i] = champ(txt, 'password', id);
+      i.autocomplete = ac; i.required = true; f.append(l); return i;
+    });
+    const msg = el('div', 'px-msg'); msg.setAttribute('role', 'status');
+    const b = el('button', 'px-ok', 'Enregistrer'); b.type = 'submit';
+    f.append(msg, b);
+    f.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const [a, n, c] = champs.map((i) => i.value);
+      if (n.length < mini || n.length > maxi) {
+        message(msg, EN_LIGNE ? 'Le nouveau mot de passe doit faire au moins 8 caractères.' : 'Le nouveau mot de passe doit faire entre 6 et 22 caractères.', true);
+        return;
+      }
+      if (n !== c) { message(msg, 'Les deux nouveaux mots de passe ne sont pas identiques.', true); return; }
+      b.disabled = true;
+      try {
+        const r = await api('/api/motdepasse', 'a=' + encodeURIComponent(a) + '&n=' + encodeURIComponent(n));
+        if (r.ok) { message(msg, 'Mot de passe enregistré.'); champs.forEach((i) => { i.value = ''; }); }
+        else message(msg, 'Le mot de passe actuel est incorrect.', true);
+      } catch (x) {
+        if (x instanceof NonConnecte) { afficherConnexion(); return; }
+        message(msg, texteEchec(), true);
+      }
+      b.disabled = false;
+    });
+
+    const sortir = el('button', 'px-sortir', 'Se déconnecter'); sortir.type = 'button';
+    sortir.onclick = async () => { try { await api('/logout', ''); } catch (x) { /* déjà déconnecté */ } afficherConnexion(); };
+    v.append(info, f, sortir);
+    return v;
+  }
+
+  function texteEchec() {
+    return EN_LIGNE ? 'Envoi impossible : vérifie ta connexion internet et réessaie.' : 'Le boîtier ne répond pas, réessaie.';
+  }
+
+  // ------------------------------------------------------------------
+  //  Mise à jour des écrans
+  // ------------------------------------------------------------------
+  function plageTexte(e) {
+    if (e.plage) return e.plage;
+    if (e.debut === undefined) return '';
+    return hhmm(e.debut) + ' à ' + hhmm(e.debut + e.heures * 60);
+  }
+  function heureTexte(e) {
+    if (e.heure) return e.heure;
+    return (e.minutes === undefined || e.minutes < 0) ? 'heure en attente' : hhmm(e.minutes);
+  }
+  function autoTexte(e) {
+    if (!e.pp) return '';
+    const t = [];
+    if (e.pp[0] !== e.pp[1]) t.push(hhmm(e.pp[0]) + '–' + hhmm(e.pp[1]));
+    if (e.pp[2] !== e.pp[3]) t.push(hhmm(e.pp[2]) + '–' + hhmm(e.pp[3]));
+    return t.length ? t.join(' et ') : 'aucune plage réglée';
+  }
+  function heuresAuto(e) { return e.pp ? (dureePlage(e.pp[0], e.pp[1]) + dureePlage(e.pp[2], e.pp[3])) / 60 : 0; }
+
+  // Qui peut faire quoi (en ligne : rôle du compte ; en local : compte admin ou famille)
+  function roleActuel(e) {
+    if (EN_LIGNE) return boitier ? boitier.role : 'proprietaire';
+    return e && e.admin === false ? 'famille' : 'proprietaire';
+  }
+  function peutModes(e) { return roleActuel(e) === 'proprietaire'; }
+  function peutSortie(s, e) {
+    const r = roleActuel(e);
+    if (r === 'proprietaire') return true;
+    if (r === 'famille') return s.type === 'lumiere' || s.type === 'simple';
+    if (r === 'location') return s.id === 'eclairage';
+    return false;
+  }
+
+  function afficher(e) {
+    dernierEtat = e;
+    const etat = $('px-etat');
+    if (!etat) return;
+    const absent = e._jamais || e._depuis !== undefined;
+    etat.className = 'px-etat' + (absent ? ' off' : '');
+    etat.lastChild.textContent = e._jamais ? 'En attente' : absent ? 'Boîtier hors ligne' : 'Connecté';
+    const p = cfg.principal;
+    if (p) $('px-principal').textContent = nb(e.capteurs[p.id], p.decimales);
+    const hFiltre = e.mode === 'auto' ? heuresAuto(e) : e.heures;
+    $('px-filtration').textContent = e.mode === 'manuel' ? 'manuelle' : e.mode === 'off' ? 'arrêt forcé' : nb(hFiltre, hFiltre % 1 ? 1 : 0) + ' h';
+    cfg.capteurs.filter((c) => c !== p).forEach((c) => {
+      const v = e.capteurs[c.id];
+      let t = (v === null || v === undefined) ? '--' : nb(v, c.decimales) + ' ' + c.unite;
+      if (e.details && e.details[c.id] && v !== null) t += ' · ' + e.details[c.id];
+      $('px-c-' + c.id).textContent = t;
+    });
+
+    // ---- Pompe ----
+    const m = cfg.modes.find((x) => x.id === e.mode);
+    const choix = $('px-mode');
+    if (choix && document.activeElement !== choix) choix.value = e.mode;
+    if (choix) choix.disabled = !peutModes(e);
+    $('px-aide').textContent = e._jamais ? '' : m ? m.aide.replace('{heures}', e.heures).replace(/\{plage\}/g, plageTexte(e))
+      .replace('{seuil}', e.seuil).replace('{auto}', autoTexte(e)) : '';
+    const marche = $('px-pompe-marche');
+    if (marche) {
+      marche.hidden = e.mode !== 'manuel';
+      marche.disabled = !peutModes(e);
+    }
+
+    // ---- Sorties ----
+    cfg.sorties.forEach((s) => {
+      const on = !!e.sorties[s.id];
+      const sm = e.smodes ? e.smodes[s.id] : null;
+      const bouton = document.querySelector('[data-sortie="' + s.id + '"]');
+      if (bouton) { bouton.setAttribute('aria-pressed', on); bouton.disabled = !peutSortie(s, e); }
+      if (s.pompe && marche) marche.setAttribute('aria-pressed', on);
+      document.querySelectorAll('[data-smode="' + s.id + '"]').forEach((b) => {
+        b.setAttribute('aria-pressed', b.dataset.v === sm);
+        b.disabled = !peutSortie(s, e);
+      });
+      let t = on ? s.on : s.off;
+      if (s.pompe) t += ' · mode ' + (m ? m.nom : e.mode);
+      else if (sm === 'auto') {
+        const prog = e.ps && e.ps[s.id];
+        t += prog ? ' · Auto ' + hhmm(prog[1]) + '–' + hhmm(prog[2]) : ' · Auto';
+      }
+      if (s.type === 'surpresseur' && sm !== 'off' && !on && !e._jamais) t += ' · attend la filtration avec débit';
+      $('px-s-' + s.id).textContent = t;
+    });
+
+    afficherEntretien(e);
+    const qui = $('px-qui'); if (qui) qui.textContent = 'Connecté en tant que « ' + (e.compte || '') + ' »';
+    const heure = $('px-heure'); if (heure) heure.textContent = e._jamais ? '' : 'Heure du boîtier : ' + heureTexte(e);
+    afficherConseils();
+  }
+
+  function remplirFormulaires(e) {
+    if (e.pp) {
+      ['px-pp-d1', 'px-pp-f1', 'px-pp-d2', 'px-pp-f2'].forEach((id, i) => { const c = $(id); if (c) c.value = hhmm(e.pp[i]); });
+      const c = $('px-pp-d1'); if (c) c.dispatchEvent(new Event('input'));
+    }
+    if (e.ps) Object.keys(e.ps).forEach((id) => {
+      const [, d, f] = e.ps[id];
+      if ($('px-ps-d-' + id)) { $('px-ps-d-' + id).value = hhmm(d); $('px-ps-f-' + id).value = hhmm(f); }
+    });
+    if (e.profil) {
+      const vol = $('px-profil-0'); if (vol) vol.value = e.profil[P_VOLUME] || '';
+      Object.keys(CHOIX).forEach((k) => {
+        const s = $('px-profil-' + k);
+        if (s) s.value = String(e.profil[k] <= CHOIX[k].options.length ? e.profil[k] : 0);
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------
+  //  Météo (c'est le téléphone qui la demande, pas le boîtier)
+  // ------------------------------------------------------------------
+  function texteMeteo(c) {
+    if (c === null || c === undefined) return '';
+    if (c === 0) return 'ensoleillé';
+    if (c <= 2) return 'éclaircies';
+    if (c === 3) return 'couvert';
+    if (c <= 48) return 'brouillard';
+    if (c <= 67) return 'pluie';
+    if (c <= 77) return 'neige';
+    if (c <= 82) return 'averses';
+    return 'orage';
+  }
+  async function chargerMeteo() {
+    if (!cfg || !cfg.lat || !cfg.lon || (Number(cfg.lat) === 0 && Number(cfg.lon) === 0)) return;
+    try {
+      const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + cfg.lat + '&longitude=' + cfg.lon +
+        '&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code&forecast_days=3&timezone=auto';
+      const r = await fetch(url);
+      if (!r.ok) return;
+      const j = await r.json();
+      meteo = {
+        t: j.current.temperature_2m, code: j.current.weather_code,
+        max: j.daily.temperature_2m_max, min: j.daily.temperature_2m_min, codes: j.daily.weather_code
+      };
+      const tuile = $('px-meteo');
+      if (tuile) tuile.textContent = Math.round(meteo.t) + ' °C · ' + texteMeteo(meteo.code);
+      afficherConseils();
+    } catch (x) { /* pas de météo : l'assistant fera sans */ }
+  }
+
+  // ------------------------------------------------------------------
+  //  Conseils automatiques (accueil)
+  // ------------------------------------------------------------------
+  function conseilChoc(e) {
+    const pr = e.profil || [];
+    if (pr[P_DESINF] === DESINF.CHLORE && pr[P_VOLUME]) {
+      const v = pr[P_VOLUME];
+      return ' Pour un traitement choc au chlore, on compte en général 10 à 20 g par m³, soit environ ' +
+        Math.round(v * 10) + ' à ' + Math.round(v * 20) + ' g pour tes ' + v + ' m³ : suis la notice de ton produit.';
+    }
+    if (pr[P_DESINF] === DESINF.ELECTROLYSEUR) return ' Avec ton électrolyseur, lance le mode « boost » ou « choc » s’il en a un.';
+    return '';
+  }
+
+  function calculerConseils(e) {
+    if (e._jamais) {
+      return [['alerte', 'Ton boîtier ne s’est encore jamais connecté. Branche-le et vérifie qu’il a accès au Wi-Fi : ses données apparaîtront ici.']];
+    }
+    const c = [];
+    if (e._depuis !== undefined) {
+      c.push(['alerte', 'Le boîtier ne donne plus de nouvelles depuis ' + dureeTexte(e._depuis) +
+        ' : vérifie son alimentation et son Wi-Fi. Tes commandes seront appliquées à son retour.']);
+    }
+    const pr = e.profil || [];
+    const eau = e.capteurs ? e.capteurs.eau : null;
+    const pompe = cfg.sorties.find((s) => s.pompe);
+    const pompeOn = pompe ? !!e.sorties[pompe.id] : false;
+
+    if (e.defautDebit) c.push(['alerte', 'Pompe arrêtée : pas de débit pendant 2 minutes. Vérifie le préfiltre, les vannes et l’amorçage, puis change de mode pour la relancer.']);
+    if (e.mode === 'off' && eau !== null && eau !== undefined && eau < (e.seuil || 5)) {
+      c.push(['alerte', 'Pompe en arrêt forcé et eau à ' + nb(eau, 1) + ' °C : risque de gel des canalisations. Passe en mode Hors-gel.']);
+    }
+
+    if (eau === null || eau === undefined) {
+      c.push(['alerte', 'La sonde d’eau ne répond pas : vérifie son câble et son branchement. En attendant, la filtration Pooly est de ' + e.heures + ' h par jour.']);
+    } else {
+      if (eau >= 28) c.push(['attention', 'Eau à ' + nb(eau, 1) + ' °C : risque d’algues. Contrôle le désinfectant et le pH plus souvent.' + conseilChoc(e)]);
+      if (eau < 12 && e.mode !== 'horsgel') c.push(['info', 'Eau sous 12 °C : c’est le moment de penser à l’hivernage et au mode Hors-gel.']);
+      if (eau < (e.seuil || 5) && e.mode === 'manuel' && !pompeOn) c.push(['alerte', 'Eau très froide et pompe arrêtée : passe en mode Hors-gel pour protéger les canalisations.']);
+      if (pr[P_DESINF] === DESINF.ELECTROLYSEUR && eau < 15) c.push(['info', 'Eau sous 15 °C : la plupart des électrolyseurs produisent mal en dessous. Passe-le en mode hiver ou coupe-le, selon sa notice.']);
+      if (pr[P_PH] === 1 && eau >= 20) c.push(['info', 'Saison de baignade : contrôle le pH et le désinfectant chaque semaine (pH idéal entre 7,0 et 7,4).']);
+    }
+
+    if (e.mode === 'auto') {
+      const h = heuresAuto(e);
+      if (h === 0) c.push(['alerte', 'Mode Auto sans aucune plage horaire : la pompe ne tournera pas. Règle tes horaires dans l’onglet Programmes.']);
+      else if (eau !== null && eau !== undefined && h < e.heures - 2) {
+        c.push(['attention', 'Tes horaires donnent ' + nb(h, h % 1 ? 1 : 0) + ' h de filtration par jour, alors qu’une eau à ' + nb(eau, 0) + ' °C en demande environ ' + e.heures + ' h.']);
+      }
+    }
+
+    if (meteo) {
+      const gel = Math.min.apply(null, meteo.min);
+      const chaud = Math.max.apply(null, meteo.max);
+      if (gel < 1 && e.mode !== 'horsgel') c.push(['alerte', 'Gel annoncé (' + Math.round(gel) + ' °C) dans les 3 jours : passe en mode Hors-gel.']);
+      if (chaud >= 33) c.push(['info', 'Fortes chaleurs annoncées (' + Math.round(chaud) + ' °C) : l’eau va se réchauffer vite, surveille le désinfectant.']);
+      if (meteo.codes.some((x) => x >= 95)) c.push(['info', 'Orage annoncé : après le passage, contrôle l’eau et fais un traitement choc si elle se trouble.' + conseilChoc(e)]);
+    }
+
+    if (e.mode === 'manuel' && pompe && !pompeOn) c.push(['attention', 'Pompe arrêtée en mode Manuel : pense à repasser en mode Thermo ou Auto pour que la filtration reprenne.']);
+
+    if (cfg.entretien && e.ent) {
+      entretiens(pr).forEach((x, i) => {
+        if (!x) return;
+        if (x.heures) {
+          const h = (e.sp - e.ent[i]) / 3600;
+          if (h >= x.heures) c.push(['attention', x.nom + ' à faire : ' + Math.round(h) + ' h de filtration depuis le dernier.']);
+        } else if (e.ent[2]) {
+          const ans = (Date.now() / 1000 - e.ent[2]) / 31557600;
+          if (ans >= x.ans) c.push(['info', x.nom + ' : le dernier date de plus de ' + x.ans + ' ans, prévois-le.']);
+        }
+      });
+    }
+
+    if (cfg.profil && (!pr[P_VOLUME] || !pr[P_DESINF] || !pr[P_FILTRE])) {
+      c.push(['info', 'Remplis la fiche « Ma piscine » (onglet Piscine) pour des conseils adaptés à ton bassin.']);
+    }
+
+    if (heureTexte(e) === 'heure en attente') c.push(['info', 'Le boîtier n’a pas encore reçu l’heure : vérifie son accès à internet. En attendant, la pompe filtre en continu.']);
+
+    if (!c.some((x) => x[0] !== 'info')) c.unshift(['ok', 'Tout va bien. Rien d’urgent à faire.']);
+    const ordre = { alerte: 0, attention: 1, ok: 2, info: 3 };
+    return c.sort((a, b) => ordre[a[0]] - ordre[b[0]]);
+  }
+
+  function afficherConseils() {
+    if (!dernierEtat) return;
+    const zone = $('px-conseils');
+    if (!zone) return;
+    zone.innerHTML = '';
+    calculerConseils(dernierEtat).forEach(([niveau, texte]) => {
+      const d = el('div', 'px-conseil ' + niveau);
+      d.append(el('i'), el('span', '', texte));
+      zone.append(d);
+    });
+  }
+
+  // ------------------------------------------------------------------
+  //  Échanges
+  // ------------------------------------------------------------------
+  function horsLigne() {
+    const etat = $('px-etat');
+    if (etat) { etat.className = 'px-etat off'; etat.lastChild.textContent = EN_LIGNE ? 'Sans connexion' : 'Hors ligne'; }
+  }
+  async function charger() {
+    try { afficher(await api('/api/etat')); }
+    catch (x) { if (x instanceof NonConnecte) afficherConnexion(); else horsLigne(); }
+  }
+  // Renvoie vrai si la commande a été acceptée
+  let rapideJusqu = 0;
+  async function envoyer(url, corps) {
+    try {
+      const e = await api(url, corps);
+      afficher(e);
+      remplirFormulaires(e);
+      rapideJusqu = Date.now() + 20000;          // on suit de près la réponse du boîtier pendant 20 s
+      return true;
+    } catch (x) {
+      if (x instanceof NonConnecte) afficherConnexion(); else charger();
+      return false;
+    }
+  }
+
+  async function demarrer() {
+    if (EN_LIGNE && !initSupabase()) {
+      racine.className = 'px-cx';
+      racine.textContent = 'Configuration incomplète : la clé Supabase manque dans index.html.';
+      return;
+    }
+    try {
+      cfg = await api('/api/config');
+    } catch (x) {
+      if (x instanceof NonConnecte) { afficherConnexion(); return; }
+      if (x instanceof AucunBoitier) { afficherReclamer(); return; }
+      retirerNav();
+      racine.className = 'px-app';
+      racine.textContent = EN_LIGNE
+        ? 'Impossible de joindre le serveur POOLY. Vérifie ta connexion internet, puis recharge la page.'
+        : 'Le boîtier ne répond pas. Vérifie que tu es sur le Wi-Fi de la maison, puis recharge la page.';
+      return;
+    }
+    construire();
+    await charger();
+    if (dernierEtat) remplirFormulaires(dernierEtat);
+    chargerMeteo();
+    arreterMinuteries();
+    // État relu toutes les 5 s, et toutes les 1,5 s juste après une commande
+    let tics = 0;
+    minuteries.push(setInterval(() => {
+      tics++;
+      if (Date.now() < rapideJusqu || tics % 4 === 0) charger();
+    }, 1500), setInterval(chargerMeteo, 30 * 60 * 1000));
+  }
+
+  demarrer();
+})();
